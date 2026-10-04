@@ -72,11 +72,14 @@ jobs:
         grep -q 'kernelsu' drivers/Makefile
         grep -q 'kernelsu' drivers/Kconfig
         echo "KernelSU 织入完成"
-        # 把补丁提交进 git，让源码树变干净，避免版本号尾部多出 "+"
+        # 把补丁提交进 git，让源码树变干净；然后删掉 .git。
+        # setlocalversion 在 LOCALVERSION_AUTO=n 时只要"标签后还有提交"就会给版本串
+        # 尾部加 "+"，删掉 .git 让它彻底沉默，uname -r 与原厂逐字节一致。
         git config user.email builder@github
         git config user.name builder
         git add -A
         git commit -q -m "DroidSpaces + KernelSU integration" || true
+        rm -rf .git
 
     - name: 生成内核配置（原厂配置 + 容器开关，保证 module_layout 指纹与原厂一致）
       run: |
