@@ -82,13 +82,22 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
+        # LLVM/LLVM_IAS 必须作为环境变量导出：Kconfig 的探测命令（HAS_LTO_CLANG、MTE 等）
+        # 只认子进程环境。配置步与编译步环境必须完全一致，否则 syncconfig 会在编译时
+        # 触发 "Restart config..." 交互重询，把强化配置全部重置成默认值。
+        export LLVM=1 LLVM_IAS=1
         mkdir -p out
         cat $GITHUB_WORKSPACE/stock-rubens.config $GITHUB_WORKSPACE/droidspaces.config $GITHUB_WORKSPACE/extra.config > out/.config
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+        echo "===== 第一次 olddefconfig 后的强化配置状态 ====="
+        grep -E 'CONFIG_(HAS_LTO_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|SHADOW_CALL_STACK|KASAN_GENERIC|KASAN_SW_TAGS|KASAN_HW_TAGS|ARM64_MTE|ARM64_AS_HAS_MTE)=' out/.config || true
         # 强制把模块兼容强相关的强化配置写回原厂状态（防止 kconfig 悄悄回落）
         ./scripts/config --file out/.config -d LTO_NONE -e LTO_CLANG_THIN -e CFI_CLANG \
           -e SHADOW_CALL_STACK -d KASAN_GENERIC -d KASAN_SW_TAGS -e KASAN_HW_TAGS
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+        echo "===== 探测环境自检（conf 子进程应能看到 LLVM/LLVM_IAS）====="
+        printf 'all:\n\t@echo "recipe env: LLVM=[$$LLVM] LLVM_IAS=[$$LLVM_IAS]"\n' > /tmp/probe.mk
+        make -f /tmp/probe.mk LLVM=1 LLVM_IAS=1
         echo "===== 容器与 KSU 配置最终状态 ====="
         grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CFS_BANDWIDTH|CGROUP_PIDS|KSU)=' out/.config
         for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CFS_BANDWIDTH CGROUP_PIDS KSU; do
@@ -104,6 +113,7 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
+        export LLVM=1 LLVM_IAS=1
         export KBUILD_BUILD_HOST=github
         export KBUILD_BUILD_USER=droidspaces-builder
         export CLANG_TRIPLE=aarch64-linux-gnu-
