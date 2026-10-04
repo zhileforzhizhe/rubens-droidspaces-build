@@ -68,8 +68,14 @@ jobs:
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-        test -d kernel/KernelSU || (echo "KernelSU 织入失败"; exit 1)
-        ls -la drivers/kernelsu || true
+        echo "--- 集成结果检查 ---"
+        ls -la drivers/kernelsu 2>/dev/null || true
+        grep -n 'kernelsu' drivers/Makefile 2>/dev/null || true
+        grep -n 'kernelsu' drivers/Kconfig 2>/dev/null || true
+        find . -maxdepth 3 -type d -name 'KernelSU' 2>/dev/null || true
+        test -e drivers/kernelsu
+        grep -q 'kernelsu' drivers/Makefile
+        grep -q 'kernelsu' drivers/Kconfig
         echo "KernelSU 织入完成"
 
     - name: 生成完整内核配置
