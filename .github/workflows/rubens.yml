@@ -85,12 +85,16 @@ jobs:
         # LLVM/LLVM_IAS 必须作为环境变量导出：Kconfig 的探测命令（HAS_LTO_CLANG、MTE 等）
         # 只认子进程环境。配置步与编译步环境必须完全一致，否则 syncconfig 会在编译时
         # 触发 "Restart config..." 交互重询，把强化配置全部重置成默认值。
+        # CROSS_COMPILE 同样关键：没有它，CLANG_FLAGS 缺少 --target=aarch64-linux-gnu，
+        # as-instr 探测按 x86_64 宿主目标编译，MTE/LTO/KASAN_HW_TAGS 全部探测失败。
         export LLVM=1 LLVM_IAS=1
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
         mkdir -p out
         cat $GITHUB_WORKSPACE/stock-rubens.config $GITHUB_WORKSPACE/droidspaces.config $GITHUB_WORKSPACE/extra.config > out/.config
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
         echo "===== 第一次 olddefconfig 后的强化配置状态 ====="
-        grep -E 'CONFIG_(HAS_LTO_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|SHADOW_CALL_STACK|KASAN_GENERIC|KASAN_SW_TAGS|KASAN_HW_TAGS|ARM64_MTE|ARM64_AS_HAS_MTE)=' out/.config || true
+        grep -E 'CONFIG_(HAS_LTO_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|SHADOW_CALL_STACK|KASAN_GENERIC|KASAN_SW_TAGS|KASAN_HW_TAGS|ARM64_MTE|ARM64_AS_HAS_MTE)(=| is)' out/.config || true
         # 强制把模块兼容强相关的强化配置写回原厂状态（防止 kconfig 悄悄回落）
         ./scripts/config --file out/.config -d LTO_NONE -e LTO_CLANG_THIN -e CFI_CLANG \
           -e SHADOW_CALL_STACK -d KASAN_GENERIC -d KASAN_SW_TAGS -e KASAN_HW_TAGS
