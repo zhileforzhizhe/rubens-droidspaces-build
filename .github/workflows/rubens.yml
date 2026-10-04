@@ -103,6 +103,7 @@ jobs:
         export CC=clang
         export HOSTCC=clang
         export HOSTCXX=clang++
+        make ARCH=arm64 mrproper
         make -j$(nproc --all) O=out ARCH=arm64 rubens_defconfig
         make -j$(nproc --all) CC="clang -w" O=out ARCH=arm64 \
           CLANG_TRIPLE="aarch64-linux-gnu-" \
