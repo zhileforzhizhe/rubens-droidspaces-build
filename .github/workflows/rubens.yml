@@ -76,6 +76,7 @@ jobs:
     - name: 生成内核配置（原厂配置 + 容器开关，保证 module_layout 指纹与原厂一致）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
         mkdir -p out
         cat $GITHUB_WORKSPACE/stock-rubens.config $GITHUB_WORKSPACE/droidspaces.config $GITHUB_WORKSPACE/extra.config > out/.config
         make O=out ARCH=arm64 LLVM=1 olddefconfig
