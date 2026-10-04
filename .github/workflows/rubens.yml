@@ -80,6 +80,9 @@ jobs:
         git add -A
         git commit -q -m "DroidSpaces + KernelSU integration" || true
         rm -rf .git
+        # setlocalversion 用 git rev-parse 找仓库（会向上找到仓库根的 .git），
+        # 只要不在标签上就输出 "+"。放一个空 .scmversion 让它直接返回，版本串干净。
+        printf '' > .scmversion
 
     - name: 生成内核配置（原厂配置 + 容器开关，保证 module_layout 指纹与原厂一致）
       run: |
