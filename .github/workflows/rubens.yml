@@ -84,11 +84,11 @@ jobs:
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
         mkdir -p out
         cat $GITHUB_WORKSPACE/stock-rubens.config $GITHUB_WORKSPACE/droidspaces.config $GITHUB_WORKSPACE/extra.config > out/.config
-        make O=out ARCH=arm64 LLVM=1 olddefconfig
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
         # 强制把模块兼容强相关的强化配置写回原厂状态（防止 kconfig 悄悄回落）
         ./scripts/config --file out/.config -d LTO_NONE -e LTO_CLANG_THIN -e CFI_CLANG \
           -e SHADOW_CALL_STACK -d KASAN_GENERIC -d KASAN_SW_TAGS -e KASAN_HW_TAGS
-        make O=out ARCH=arm64 LLVM=1 olddefconfig
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
         echo "===== 容器与 KSU 配置最终状态 ====="
         grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CFS_BANDWIDTH|CGROUP_PIDS|KSU)=' out/.config
         for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CFS_BANDWIDTH CGROUP_PIDS KSU; do
@@ -98,7 +98,7 @@ jobs:
         for c in LTO_CLANG_THIN CFI_CLANG SHADOW_CALL_STACK KASAN_HW_TAGS MODVERSIONS MODULE_UNLOAD; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "强化配置 ${c} 未能保持原厂状态，中止"; exit 1; }
         done
-        grep -E 'CONFIG_(LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|CFI_CLANG_SHADOW|SHADOW_CALL_STACK|KASAN|TRIM_UNUSED_KSYMS|MODVERSIONS|MODULE_UNLOAD)=' out/.config || true
+        grep -E 'CONFIG_(HAS_LTO_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|CFI_CLANG_SHADOW|SHADOW_CALL_STACK|KASAN|TRIM_UNUSED_KSYMS|MODVERSIONS|MODULE_UNLOAD)=' out/.config || true
 
     - name: 编译内核（仅 Image.gz，设备驱动模块由原厂 vendor 分区提供）
       run: |
