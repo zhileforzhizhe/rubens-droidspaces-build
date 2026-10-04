@@ -5,26 +5,19 @@ on:
 
 jobs:
   build:
-    name: Build DroidSpaces + KernelSU kernel
+    name: Build GKI stock-ABI kernel (DroidSpaces + KernelSU)
     runs-on: ubuntu-latest
     if: github.event.repository.owner.id == github.event.sender.id
 
     steps:
     - uses: actions/checkout@v4
 
-    - name: 读取配置
-      run: |
-        cat config.env | grep KERNEL_SOURCE= >> $GITHUB_ENV
-        cat config.env | grep KERNEL_SOURCE_BRANCH= >> $GITHUB_ENV
-        cat config.env | grep KERNEL_ZIP_NAME= >> $GITHUB_ENV
-        cat config.env | grep KERNEL_IMAGE_NAME= >> $GITHUB_ENV
-
     - name: 安装编译依赖
       run: |
         sudo apt-get update
-        sudo -E apt-get -y -qq install git make bc bison openssl zip kmod cpio flex libelf-dev curl libssl-dev wget device-tree-compiler ca-certificates python3 binutils binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+        sudo -E apt-get -y -qq install git make bc bison openssl zip flex libelf-dev curl libssl-dev ca-certificates python3
 
-    - name: 下载 Clang 编译器（只取需要的版本，省磁盘）
+    - name: 下载 Clang r416183b（与原厂内核完全相同的编译器）
       run: |
         mkdir -p $GITHUB_WORKSPACE/kernel_workspace
         cd $GITHUB_WORKSPACE/kernel_workspace
@@ -33,10 +26,16 @@ jobs:
         git sparse-checkout set clang-r416183b
         ls clang-r416183b/bin/clang
 
-    - name: 下载内核源码
+    - name: 下载 AOSP GKI 内核源码（android12-5.10.209_r00，与原厂同源同版本）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone ${{ env.KERNEL_SOURCE }} -b ${{ env.KERNEL_SOURCE_BRANCH }} android-kernel --depth=1
+        git init -q android-kernel
+        cd android-kernel
+        git remote add origin https://android.googlesource.com/kernel/common
+        git fetch -q --depth=1 origin refs/tags/android12-5.10.209_r00
+        git checkout -q FETCH_HEAD
+        echo "===== 源码版本 ====="
+        head -5 Makefile
 
     - name: 打 DroidSpaces 官方 GKI 补丁（kABI 安全，不破坏原厂驱动兼容）
       run: |
@@ -69,28 +68,26 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
         echo "--- 集成结果检查 ---"
-        ls -la drivers/kernelsu 2>/dev/null || true
-        grep -n 'kernelsu' drivers/Makefile 2>/dev/null || true
-        grep -n 'kernelsu' drivers/Kconfig 2>/dev/null || true
-        find . -maxdepth 3 -type d -name 'KernelSU' 2>/dev/null || true
         test -e drivers/kernelsu
         grep -q 'kernelsu' drivers/Makefile
         grep -q 'kernelsu' drivers/Kconfig
         echo "KernelSU 织入完成"
 
-    - name: 生成完整内核配置
+    - name: 生成内核配置（原厂配置 + 容器开关，保证 module_layout 指纹与原厂一致）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        make ARCH=arm64 gki_defconfig
-        ./scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/xiaomi_mt6895.config
-        ./scripts/kconfig/merge_config.sh -m .config arch/arm64/configs/vendor/rubens.config
-        ./scripts/kconfig/merge_config.sh -m .config $GITHUB_WORKSPACE/droidspaces.config
-        make ARCH=arm64 olddefconfig
-        cp .config arch/arm64/configs/rubens_defconfig
-        echo "===== 容器与 KSU 配置最终状态 ====="
-        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CFS_BANDWIDTH|CGROUP_PIDS|KSU)[= ]' .config || true
+        mkdir -p out
+        cat $GITHUB_WORKSPACE/stock-rubens.config $GITHUB_WORKSPACE/droidspaces.config $GITHUB_WORKSPACE/extra.config > out/.config
+        make O=out ARCH=arm64 LLVM=1 olddefconfig
+        echo "===== 容器与 KSU 配置最终状态（13 项必须全 =y）====="
+        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CFS_BANDWIDTH|CGROUP_PIDS|KSU)=' out/.config
+        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CFS_BANDWIDTH CGROUP_PIDS KSU; do
+          grep -q "CONFIG_${c}=y" out/.config || { echo "配置 ${c} 未能开启"; exit 1; }
+        done
+        echo "===== 模块兼容关键配置（应与原厂一致）====="
+        grep -E 'CONFIG_(MODVERSIONS|MODULE_UNLOAD|LTO_CLANG|CFI_CLANG|SHADOW_CALL_STACK|KASAN_HW_TAGS|TRIM_UNUSED_KSYMS)=' out/.config || true
 
-    - name: 编译内核
+    - name: 编译内核（仅 Image.gz，设备驱动模块由原厂 vendor 分区提供）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
@@ -99,41 +96,18 @@ jobs:
         export CLANG_TRIPLE=aarch64-linux-gnu-
         export CROSS_COMPILE=aarch64-linux-gnu-
         export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-        export ARCH=arm64
-        export CC=clang
-        export HOSTCC=clang
-        export HOSTCXX=clang++
-        make ARCH=arm64 mrproper
-        make -j$(nproc --all) O=out ARCH=arm64 rubens_defconfig
-        make -j$(nproc --all) CC="clang -w" O=out ARCH=arm64 \
-          CLANG_TRIPLE="aarch64-linux-gnu-" \
-          CROSS_COMPILE="aarch64-linux-gnu-" \
-          CROSS_COMPILE_ARM32="arm-linux-gnueabi-" \
-          LLVM=1 LLVM_IAS=1
+        make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image.gz
+        echo "===== 内核版本字符串（必须与原厂一致）====="
+        cat out/include/config/kernel.release
 
-    - name: 打包 AnyKernel3 刷机包
+    - name: 收集产物
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        git clone -q https://github.com/osm0sis/AnyKernel3
-        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' AnyKernel3/anykernel.sh
-        sed -i 's!block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!block=auto;!g' AnyKernel3/anykernel.sh
-        sed -i 's/is_slot_device=1;/is_slot_device=auto;/g' AnyKernel3/anykernel.sh
-        cp android-kernel/out/arch/arm64/boot/${{ env.KERNEL_IMAGE_NAME }} AnyKernel3/
-        rm -rf AnyKernel3/.git* AnyKernel3/README.md
-        rm -rf AnyKernel3/ramdisk AnyKernel3/modules AnyKernel3/patch
-        cd AnyKernel3
-        zip -r9 $GITHUB_WORKSPACE/${{ env.KERNEL_ZIP_NAME }}.zip .
-        cd $GITHUB_WORKSPACE/kernel_workspace
         mkdir -p kernel_images
+        cp android-kernel/out/arch/arm64/boot/Image.gz kernel_images/
         cp android-kernel/out/arch/arm64/boot/Image kernel_images/ 2>/dev/null || true
-        cp android-kernel/out/arch/arm64/boot/Image.gz kernel_images/ 2>/dev/null || true
         cp android-kernel/out/.config kernel_images/built-config.txt
-
-    - name: 上传刷机包
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ env.KERNEL_ZIP_NAME }}
-        path: kernel_workspace/${{ env.KERNEL_ZIP_NAME }}.zip
+        cp android-kernel/out/include/config/kernel.release kernel_images/kernel-release.txt
 
     - name: 上传内核镜像与最终配置
       uses: actions/upload-artifact@v4
