@@ -65,29 +65,6 @@ jobs:
           echo "警告: POSIX_MQUEUE 补丁无法应用，继续构建"
         fi
 
-    - name: 001 补丁布局中性化（消除 task_struct 尾部 +16 字节位移）
-      run: |
-        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        # 官方 001 补丁用 ANDROID_KABI_USE(6, sysvsem) 把 8 字节填充位换成 24 字节
-        # union，导致 task_struct 净增 16 字节、thread_struct 整体后移。
-        # __GENKSYMS__ 只保 CRC 不保布局。这里改成 RESERVE(6/7/8) 共 24 字节
-        # 原地塞入 sysvsem(24B)+sysvshm(16B)：尺寸中性、CRC 中性、字段名不变。
-        python3 - <<'PYEOF'
-        T = chr(9)
-        NL = chr(10)
-        p = 'include/linux/sched.h'
-        s = open(p).read()
-        old = T + 'ANDROID_KABI_USE(6, struct sysv_sem sysvsem);' + NL + T + '_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm);' + NL
-        new = T + '_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(6); ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8),' + NL + T + T + 'struct sysv_sem sysvsem; struct sysv_shm sysvshm);' + NL
-        if old not in s:
-            print('ERROR: 001 补丁产物文本未找到，中性化失败')
-            raise SystemExit(1)
-        open(p, 'w').write(s.replace(old, new))
-        print('sched.h 布局中性化完成')
-        PYEOF
-        echo "--- 中性化结果验证 ---"
-        grep -n "struct sysv_sem sysvsem; struct sysv_shm sysvshm" include/linux/sched.h
-
     - name: 关闭模块 CRC 指纹校验（容器开关改变了类型闭包指纹，但实际内存布局与原厂兼容）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
