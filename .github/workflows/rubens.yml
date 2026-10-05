@@ -68,20 +68,13 @@ jobs:
     - name: 关闭模块 CRC 指纹校验（容器开关改变了类型闭包指纹，但实际内存布局与原厂兼容）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        python3 - <<'EOF'
-        p = 'kernel/module.c'
-        s = open(p).read()
-        old = '''\tpr_warn("%s: disagrees about version of symbol %s\\n",
-\t       info->name, symname);
-\treturn 0;'''
-        new = '''\tpr_warn("%s: disagrees about version of symbol %s (accepted, CRC check disabled)\\n",
-\t       info->name, symname);
-\treturn 1;'''
-        assert s.count(old) == 1, 'check_version patch pattern not found'
-        open(p, 'w').write(s.replace(old, new))
-        print('module.c CRC 校验已关闭（bad_version 路径改为放行）')
-        EOF
-        grep -n "accepted, CRC check disabled" kernel/module.c
+        # 只把 bad_version 路径的 return 0 改成 return 1：
+        # 模块照常加载，dmesg 仍会打印哪些符号指纹不符，便于诊断。
+        # 匹配行首 TAB+7空格 的 pr_warn 续行，下一行才是目标，避免误伤 1351 行的 pr_warn_once。
+        sed -i $'/^\t       info->name, symname);/{n;s/^\treturn 0;/\treturn 1;/}' kernel/module.c
+        echo "--- 补丁结果验证 ---"
+        awk '/^\t       info->name, symname);/{getline; print; exit}' kernel/module.c | grep -q "return 1;" || { echo "module.c CRC 补丁未生效"; exit 1; }
+        echo "module.c CRC 校验已关闭（bad_version 放行）"
 
     - name: 织入 KernelSU
       run: |
