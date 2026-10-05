@@ -26,16 +26,20 @@ jobs:
         git sparse-checkout set clang-r416183b
         ls clang-r416183b/bin/clang
 
-    - name: 下载 AOSP GKI 内核源码（android12-5.10.209_r00，与原厂同源同版本）
+    - name: 下载 AOSP GKI 内核源码（精确提交 4ea09a298bb4，与原厂内核逐提交一致）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
         git init -q android-kernel
         cd android-kernel
+        # 原厂版本串 ...-00019-g4ea09a298bb4-... 说明源码就在提交 4ea09a298bb4，
+        # 不是 _r00 标签（标签落后 56 个提交，module_layout 指纹会不一致）
         git remote add origin https://android.googlesource.com/kernel/common
-        git fetch -q --depth=1 origin refs/tags/android12-5.10.209_r00
+        git fetch -q --depth=1 origin 4ea09a298bb470d0572d130b19cfa797583cd2b0 || \
+          git fetch -q --depth=1 https://github.com/aosp-mirror/kernel_common.git 4ea09a298bb470d0572d130b19cfa797583cd2b0
         git checkout -q FETCH_HEAD
         echo "===== 源码版本 ====="
         head -5 Makefile
+        git log --oneline -1
 
     - name: 打 DroidSpaces 官方 GKI 补丁（kABI 安全，不破坏原厂驱动兼容）
       run: |
