@@ -108,10 +108,12 @@ jobs:
           -e SHADOW_CALL_STACK -d KASAN_GENERIC -d KASAN_SW_TAGS -e KASAN_HW_TAGS
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
         echo "===== 容器与 KSU 配置最终状态 ====="
-        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CFS_BANDWIDTH|CGROUP_PIDS|KSU)=' out/.config
-        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CFS_BANDWIDTH CGROUP_PIDS KSU; do
+        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CGROUP_PIDS|KSU|CFS_BANDWIDTH)(=| is)' out/.config
+        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CGROUP_PIDS KSU; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "配置 ${c} 未能开启"; exit 1; }
         done
+        # CFS_BANDWIDTH 必须保持关闭：它往 struct rq 中段插字段，挪动 vendor 模块内联偏移
+        grep -q "CONFIG_CFS_BANDWIDTH is not set" out/.config || { echo "CFS_BANDWIDTH 未保持关闭（会破坏 struct rq 布局）"; exit 1; }
         echo "===== 模块兼容强化配置（必须与原厂一致）====="
         for c in LTO_CLANG_THIN CFI_CLANG SHADOW_CALL_STACK KASAN_HW_TAGS MODVERSIONS MODULE_UNLOAD; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "强化配置 ${c} 未能保持原厂状态，中止"; exit 1; }
