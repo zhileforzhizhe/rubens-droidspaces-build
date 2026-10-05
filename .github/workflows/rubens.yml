@@ -145,6 +145,15 @@ jobs:
         cp android-kernel/out/arch/arm64/boot/Image kernel_images/ 2>/dev/null || true
         cp android-kernel/out/.config kernel_images/built-config.txt
         cp android-kernel/out/include/config/kernel.release kernel_images/kernel-release.txt
+        cp android-kernel/out/Module.symvers kernel_images/ 2>/dev/null || true
+        echo "===== module_layout 指纹（原厂驱动期望 0x7c24b32d）====="
+        grep -E "module_layout" android-kernel/out/Module.symvers || echo "警告: Module.symvers 中没有 module_layout"
+        echo "===== 指纹比对结果 ====="
+        if grep -qiE "^0x7c24b32d[[:space:]]+module_layout" android-kernel/out/Module.symvers; then
+          echo "指纹一致：module_layout = 0x7c24b32d，原厂驱动应可加载"
+        else
+          echo "指纹不一致！原厂驱动将拒绝加载，禁止刷机，需回溯排查"
+        fi
 
     - name: 上传内核镜像与最终配置
       uses: actions/upload-artifact@v4
