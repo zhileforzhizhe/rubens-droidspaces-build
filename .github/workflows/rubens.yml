@@ -5,9 +5,13 @@ on:
 
 jobs:
   build:
-    name: Build GKI stock-ABI kernel (DroidSpaces + KernelSU)
+    name: Bisect variant ${{ matrix.variant }}
     runs-on: ubuntu-latest
     if: github.event.repository.owner.id == github.event.sender.id
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [pure, ksu, flips, full]
 
     steps:
     - uses: actions/checkout@v4
@@ -31,8 +35,6 @@ jobs:
         cd $GITHUB_WORKSPACE/kernel_workspace
         git init -q android-kernel
         cd android-kernel
-        # 原厂版本串 ...-00019-g4ea09a298bb4-... 说明源码就在提交 4ea09a298bb4，
-        # 不是 _r00 标签（标签落后 56 个提交，module_layout 指纹会不一致）
         git remote add origin https://android.googlesource.com/kernel/common
         git fetch -q --depth=1 origin 4ea09a298bb470d0572d130b19cfa797583cd2b0 || \
           git fetch -q --depth=1 https://github.com/aosp-mirror/kernel_common.git 4ea09a298bb470d0572d130b19cfa797583cd2b0
@@ -41,7 +43,8 @@ jobs:
         head -5 Makefile
         git log --oneline -1
 
-    - name: 打 DroidSpaces 官方 GKI 补丁（kABI 安全，不破坏原厂驱动兼容）
+    - name: 打 DroidSpaces 官方 GKI 补丁（仅 full 变体）
+      if: matrix.variant == 'full'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         BASE=https://raw.githubusercontent.com/ravindu644/Droidspaces-OSS/main/Documentation/resources/kernel-patches/GKI/below-kernel-6.12
@@ -67,7 +70,8 @@ jobs:
           echo "警告: POSIX_MQUEUE 补丁无法应用，继续构建"
         fi
 
-    - name: 织入 KernelSU
+    - name: 织入 KernelSU（ksu/full 变体）
+      if: matrix.variant == 'ksu' || matrix.variant == 'full'
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
@@ -76,54 +80,64 @@ jobs:
         grep -q 'kernelsu' drivers/Makefile
         grep -q 'kernelsu' drivers/Kconfig
         echo "KernelSU 织入完成"
-        # 把补丁提交进 git，让源码树变干净；然后删掉 .git。
-        # setlocalversion 在 LOCALVERSION_AUTO=n 时只要"标签后还有提交"就会给版本串
-        # 尾部加 "+"，删掉 .git 让它彻底沉默，uname -r 与原厂逐字节一致。
         git config user.email builder@github
         git config user.name builder
         git add -A
         git commit -q -m "DroidSpaces + KernelSU integration" || true
         rm -rf .git
-        # setlocalversion 用 git rev-parse 找仓库（会向上找到仓库根的 .git），
-        # 只要不在标签上就输出 "+"。放一个空 .scmversion 让它直接返回，版本串干净。
         printf '' > .scmversion
 
-    - name: 生成内核配置（原厂配置 + 容器开关，保证 module_layout 指纹与原厂一致）
+    - name: 清理版本串环境（pure/flips 变体）
+      if: matrix.variant == 'pure' || matrix.variant == 'flips'
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        rm -rf .git
+        printf '' > .scmversion
+
+    - name: 生成内核配置
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
-        # LLVM/LLVM_IAS 必须作为环境变量导出：Kconfig 的探测命令（HAS_LTO_CLANG、MTE 等）
-        # 只认子进程环境。配置步与编译步环境必须完全一致，否则 syncconfig 会在编译时
-        # 触发 "Restart config..." 交互重询，把强化配置全部重置成默认值。
-        # CROSS_COMPILE 同样关键：没有它，CLANG_FLAGS 缺少 --target=aarch64-linux-gnu，
-        # as-instr 探测按 x86_64 宿主目标编译，MTE/LTO/KASAN_HW_TAGS 全部探测失败。
         export LLVM=1 LLVM_IAS=1
         export CROSS_COMPILE=aarch64-linux-gnu-
         export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
         mkdir -p out
-        cat $GITHUB_WORKSPACE/stock-rubens.config $GITHUB_WORKSPACE/droidspaces.config $GITHUB_WORKSPACE/extra.config > out/.config
+        VARIANT="${{ matrix.variant }}"
+        case "$VARIANT" in
+          pure)
+            cat $GITHUB_WORKSPACE/stock-rubens.config > out/.config ;;
+          ksu)
+            cat $GITHUB_WORKSPACE/stock-rubens.config > out/.config
+            echo "CONFIG_KSU=y" >> out/.config ;;
+          flips)
+            grep -v '^CONFIG_KSU=y' $GITHUB_WORKSPACE/droidspaces.config > /tmp/ds-noksu.config
+            cat $GITHUB_WORKSPACE/stock-rubens.config /tmp/ds-noksu.config $GITHUB_WORKSPACE/extra.config > out/.config ;;
+          full)
+            cat $GITHUB_WORKSPACE/stock-rubens.config $GITHUB_WORKSPACE/droidspaces.config $GITHUB_WORKSPACE/extra.config > out/.config ;;
+        esac
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-        echo "===== 第一次 olddefconfig 后的强化配置状态 ====="
+        echo "===== [${VARIANT}] 第一次 olddefconfig 后的强化配置状态 ====="
         grep -E 'CONFIG_(HAS_LTO_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|SHADOW_CALL_STACK|KASAN_GENERIC|KASAN_SW_TAGS|KASAN_HW_TAGS|ARM64_MTE|ARM64_AS_HAS_MTE)(=| is)' out/.config || true
-        # 强制把模块兼容强相关的强化配置写回原厂状态（防止 kconfig 悄悄回落）
         ./scripts/config --file out/.config -d LTO_NONE -e LTO_CLANG_THIN -e CFI_CLANG \
           -e SHADOW_CALL_STACK -d KASAN_GENERIC -d KASAN_SW_TAGS -e KASAN_HW_TAGS
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-        echo "===== 探测环境自检（conf 子进程应能看到 LLVM/LLVM_IAS）====="
-        printf 'all:\n\t@echo "recipe env: LLVM=[$$LLVM] LLVM_IAS=[$$LLVM_IAS]"\n' > /tmp/probe.mk
-        make -f /tmp/probe.mk LLVM=1 LLVM_IAS=1
-        echo "===== 容器与 KSU 配置最终状态 ====="
-        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CFS_BANDWIDTH|CGROUP_PIDS|KSU)=' out/.config
-        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CFS_BANDWIDTH CGROUP_PIDS KSU; do
-          grep -q "CONFIG_${c}=y" out/.config || { echo "配置 ${c} 未能开启"; exit 1; }
-        done
-        echo "===== 模块兼容强化配置（必须与原厂一致）====="
+        echo "===== [${VARIANT}] 容器与 KSU 配置最终状态 ====="
+        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CFS_BANDWIDTH|CGROUP_PIDS|KSU)=' out/.config || true
+        if [ "$VARIANT" = "flips" ] || [ "$VARIANT" = "full" ]; then
+          for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CFS_BANDWIDTH CGROUP_PIDS; do
+            grep -q "CONFIG_${c}=y" out/.config || { echo "配置 ${c} 未能开启"; exit 1; }
+          done
+        fi
+        if [ "$VARIANT" = "ksu" ] || [ "$VARIANT" = "full" ]; then
+          grep -q "CONFIG_KSU=y" out/.config || { echo "配置 KSU 未能开启"; exit 1; }
+        fi
+        echo "===== [${VARIANT}] 模块兼容强化配置（必须与原厂一致）====="
         for c in LTO_CLANG_THIN CFI_CLANG SHADOW_CALL_STACK KASAN_HW_TAGS MODVERSIONS MODULE_UNLOAD; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "强化配置 ${c} 未能保持原厂状态，中止"; exit 1; }
         done
         grep -E 'CONFIG_(HAS_LTO_CLANG|LTO_NONE|LTO_CLANG_FULL|LTO_CLANG_THIN|CFI_CLANG|CFI_CLANG_SHADOW|SHADOW_CALL_STACK|KASAN|TRIM_UNUSED_KSYMS|MODVERSIONS|MODULE_UNLOAD)=' out/.config || true
 
-    - name: 编译内核（仅 Image.gz，设备驱动模块由原厂 vendor 分区提供）
+    - name: 编译内核
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
         export PATH=$GITHUB_WORKSPACE/kernel_workspace/clang-aosp/clang-r416183b/bin:$PATH
@@ -134,31 +148,27 @@ jobs:
         export CROSS_COMPILE=aarch64-linux-gnu-
         export CROSS_COMPILE_ARM32=arm-linux-gnueabi-
         make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image.gz
-        echo "===== 内核版本字符串（必须与原厂一致）====="
+        echo "===== [${{ matrix.variant }}] 内核版本字符串 ====="
         cat out/include/config/kernel.release
 
-    - name: 收集产物
+    - name: 收集符号表并比对指纹
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace
-        mkdir -p kernel_images
-        cp android-kernel/out/arch/arm64/boot/Image.gz kernel_images/
-        cp android-kernel/out/arch/arm64/boot/Image kernel_images/ 2>/dev/null || true
-        cp android-kernel/out/.config kernel_images/built-config.txt
-        cp android-kernel/out/include/config/kernel.release kernel_images/kernel-release.txt
-        cp android-kernel/out/vmlinux.symvers kernel_images/Module.symvers 2>/dev/null || cp android-kernel/out/Module.symvers kernel_images/Module.symvers 2>/dev/null || true
+        mkdir -p symvers_out
         SYMVER=android-kernel/out/vmlinux.symvers
         [ -f "$SYMVER" ] || SYMVER=android-kernel/out/Module.symvers
-        echo "===== module_layout 指纹（原厂驱动期望 0x7c24b32d）====="
+        cp "$SYMVER" symvers_out/vmlinux.symvers
+        cp android-kernel/out/.config symvers_out/built-config.txt
+        echo "===== [${{ matrix.variant }}] module_layout 指纹（原厂驱动期望 0x7c24b32d）====="
         grep -E "module_layout" "$SYMVER" || echo "警告: 符号表中没有 module_layout"
-        echo "===== 指纹比对结果 ====="
         if grep -qiE "^0x7c24b32d[[:space:]]+module_layout" "$SYMVER"; then
-          echo "指纹一致：module_layout = 0x7c24b32d，原厂驱动应可加载"
+          echo "[${{ matrix.variant }}] 指纹一致"
         else
-          echo "指纹不一致！原厂驱动将拒绝加载，禁止刷机，需回溯排查"
+          echo "[${{ matrix.variant }}] 指纹不一致"
         fi
 
-    - name: 上传内核镜像与最终配置
+    - name: 上传符号表
       uses: actions/upload-artifact@v4
       with:
-        name: kernel_images
-        path: kernel_workspace/kernel_images/*
+        name: symvers_${{ matrix.variant }}
+        path: kernel_workspace/symvers_out/*
