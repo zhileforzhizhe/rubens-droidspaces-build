@@ -79,7 +79,7 @@ jobs:
     - name: 织入 KernelSU
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
-        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v3.3.0
         echo "--- 集成结果检查 ---"
         test -e drivers/kernelsu
         grep -q 'kernelsu' drivers/Makefile
