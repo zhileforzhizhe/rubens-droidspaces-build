@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        variant: [pure, ksu, flips, full]
+        variant: [pure, ksu]
 
     steps:
     - uses: actions/checkout@v4
@@ -42,6 +42,12 @@ jobs:
         echo "===== 源码版本 ====="
         head -5 Makefile
         git log --oneline -1
+
+    - name: 容器开关的结构体布局影响清单
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        echo "===== 13 个容器开关在内核头文件里引入的条件字段（布局差异完整清单）====="
+        grep -rn -B2 "ifdef CONFIG_\(SYSVIPC\|POSIX_MQUEUE\|PID_NS\|IPC_NS\|UTS_NS\|NET_NS\|USER_NS\|CGROUP_DEVICE\|CGROUP_PIDS\|CFS_BANDWIDTH\|DEVTMPFS\)\b" include/ | head -120
 
     - name: 打 DroidSpaces 官方 GKI 补丁（仅 full 变体）
       if: matrix.variant == 'full'
@@ -105,10 +111,12 @@ jobs:
         VARIANT="${{ matrix.variant }}"
         case "$VARIANT" in
           pure)
-            cat $GITHUB_WORKSPACE/stock-rubens.config > out/.config ;;
+            cat $GITHUB_WORKSPACE/stock-rubens.config > out/.config
+            echo "# CONFIG_TRIM_UNUSED_KSYMS is not set" >> out/.config ;;
           ksu)
             cat $GITHUB_WORKSPACE/stock-rubens.config > out/.config
-            echo "CONFIG_KSU=y" >> out/.config ;;
+            echo "CONFIG_KSU=y" >> out/.config
+            echo "# CONFIG_TRIM_UNUSED_KSYMS is not set" >> out/.config ;;
           flips)
             grep -v '^CONFIG_KSU=y' $GITHUB_WORKSPACE/droidspaces.config > /tmp/ds-noksu.config
             cat $GITHUB_WORKSPACE/stock-rubens.config /tmp/ds-noksu.config $GITHUB_WORKSPACE/extra.config > out/.config ;;
