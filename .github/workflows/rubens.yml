@@ -65,6 +65,29 @@ jobs:
           echo "警告: POSIX_MQUEUE 补丁无法应用，继续构建"
         fi
 
+    - name: 001 补丁布局中性化（消除 task_struct 尾部 +16 字节位移）
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        # 官方 001 补丁用 ANDROID_KABI_USE(6, sysvsem) 把 8 字节填充位换成 24 字节
+        # union，导致 task_struct 净增 16 字节、thread_struct 整体后移。
+        # __GENKSYMS__ 只保 CRC 不保布局。这里改成 RESERVE(6/7/8) 共 24 字节
+        # 原地塞入 sysvsem(24B)+sysvshm(16B)：尺寸中性、CRC 中性、字段名不变。
+        python3 - <<'PYEOF'
+        T = chr(9)
+        NL = chr(10)
+        p = 'include/linux/sched.h'
+        s = open(p).read()
+        old = T + 'ANDROID_KABI_USE(6, struct sysv_sem sysvsem);' + NL + T + '_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8), struct sysv_shm sysvshm);' + NL
+        new = T + '_ANDROID_KABI_REPLACE(ANDROID_KABI_RESERVE(6); ANDROID_KABI_RESERVE(7); ANDROID_KABI_RESERVE(8),' + NL + T + T + 'struct sysv_sem sysvsem; struct sysv_shm sysvshm);' + NL
+        if old not in s:
+            print('ERROR: 001 补丁产物文本未找到，中性化失败')
+            raise SystemExit(1)
+        open(p, 'w').write(s.replace(old, new))
+        print('sched.h 布局中性化完成')
+        PYEOF
+        echo "--- 中性化结果验证 ---"
+        grep -n "struct sysv_sem sysvsem; struct sysv_shm sysvshm" include/linux/sched.h
+
     - name: 关闭模块 CRC 指纹校验（容器开关改变了类型闭包指纹，但实际内存布局与原厂兼容）
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
@@ -108,12 +131,16 @@ jobs:
           -e SHADOW_CALL_STACK -d KASAN_GENERIC -d KASAN_SW_TAGS -e KASAN_HW_TAGS
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
         echo "===== 容器与 KSU 配置最终状态 ====="
-        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|CGROUP_DEVICE|DEVTMPFS|CGROUP_PIDS|KSU|CFS_BANDWIDTH)(=| is)' out/.config
-        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS CGROUP_DEVICE DEVTMPFS CGROUP_PIDS KSU; do
+        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|DEVTMPFS|KSU|CFS_BANDWIDTH|CGROUP_DEVICE|CGROUP_PIDS)(=| is)' out/.config
+        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS DEVTMPFS KSU; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "配置 ${c} 未能开启"; exit 1; }
         done
-        # CFS_BANDWIDTH 必须保持关闭：它往 struct rq 中段插字段，挪动 vendor 模块内联偏移
-        grep -q "CONFIG_CFS_BANDWIDTH is not set" out/.config || { echo "CFS_BANDWIDTH 未保持关闭（会破坏 struct rq 布局）"; exit 1; }
+        # 以下配置必须保持关闭：都会改变 vendor 模块内联读取的结构体布局
+        # CFS_BANDWIDTH 挪动 struct rq；CGROUP_DEVICE/PIDS 增大 CGROUP_SUBSYS_COUNT，
+        # 挪动 css_set->subsys[] 数组与各子系统索引。
+        for c in CFS_BANDWIDTH CGROUP_DEVICE CGROUP_PIDS; do
+          grep -q "CONFIG_${c} is not set" out/.config || { echo "${c} 未保持关闭（会破坏 struct rq / css_set 布局）"; exit 1; }
+        done
         echo "===== 模块兼容强化配置（必须与原厂一致）====="
         for c in LTO_CLANG_THIN CFI_CLANG SHADOW_CALL_STACK KASAN_HW_TAGS MODVERSIONS MODULE_UNLOAD; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "强化配置 ${c} 未能保持原厂状态，中止"; exit 1; }
@@ -133,6 +160,44 @@ jobs:
         make -j$(nproc) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 Image.gz
         echo "===== 内核版本字符串（必须与原厂一致）====="
         cat out/include/config/kernel.release
+
+    - name: 导出关键结构体偏移（DWARF，用于与 vendor 模块内联偏移对表）
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        VMLINUX=$(find out -maxdepth 3 -type f -name vmlinux | head -1)
+        echo "vmlinux: $VMLINUX"
+        ls -la "$VMLINUX"
+        DWARFDUMP=$(find $GITHUB_WORKSPACE/kernel_workspace/clang-aosp -type f -name 'llvm-dwarfdump*' | head -1)
+        echo "dwarfdump: $DWARFDUMP"
+        mkdir -p $GITHUB_WORKSPACE/kernel_workspace/struct_offsets
+        if [ -n "$DWARFDUMP" ]; then
+          chmod +x "$DWARFDUMP" 2>/dev/null || true
+          "$DWARFDUMP" --name=task_struct --name=thread_struct --name=signal_struct \
+            --name=sighand_struct --name=mm_struct --name=nsproxy --name=cred \
+            --name=user_struct --name=css_set --name=cgroup --name=cgroup_subsys_state \
+            --name=task_group --name=rq --name=cfs_rq --name=sched_entity \
+            --name=ipc_namespace --name=pid --name=pid_namespace \
+            "$VMLINUX" > $GITHUB_WORKSPACE/kernel_workspace/struct_offsets/all-structs.txt 2>&1 || true
+          echo "--- 导出行数 ---"
+          wc -l $GITHUB_WORKSPACE/kernel_workspace/struct_offsets/all-structs.txt
+        else
+          echo "警告: llvm-dwarfdump 不可用"
+        fi
+        # vmlinux 单独压缩留存，本地可用 pyelftools 再解析（gzip -1 快速压缩）
+        gzip -1 -c "$VMLINUX" > $GITHUB_WORKSPACE/kernel_workspace/vmlinux.gz
+        ls -la $GITHUB_WORKSPACE/kernel_workspace/struct_offsets/ $GITHUB_WORKSPACE/kernel_workspace/vmlinux.gz
+
+    - name: 上传结构体偏移
+      uses: actions/upload-artifact@v4
+      with:
+        name: struct_offsets
+        path: kernel_workspace/struct_offsets/*
+
+    - name: 上传 vmlinux（含 DWARF，备用）
+      uses: actions/upload-artifact@v4
+      with:
+        name: vmlinux_debug
+        path: kernel_workspace/vmlinux.gz
 
     - name: 收集产物
       run: |
