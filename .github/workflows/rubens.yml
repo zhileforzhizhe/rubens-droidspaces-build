@@ -76,6 +76,17 @@ jobs:
         awk '/^\t       info->name, symname);/{getline; print; exit}' kernel/module.c | grep -q "return 1;" || { echo "module.c CRC 补丁未生效"; exit 1; }
         echo "module.c CRC 校验已关闭（bad_version 放行）"
 
+    - name: 打 NTsync 补丁（容器 Wine/游戏同步原语；纯新增驱动+宏级 lockdep 回移，kABI 安全）
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        git apply $GITHUB_WORKSPACE/patches/ntsync/ntsync_base.patch
+        git apply $GITHUB_WORKSPACE/patches/ntsync/ntsync_compat_android12-5.10.patch
+        test -f drivers/misc/ntsync.c
+        test -f include/uapi/linux/ntsync.h
+        grep -q 'config NTSYNC' drivers/misc/Kconfig
+        grep -q 'ntsync.o' drivers/misc/Makefile
+        echo "NTsync 补丁应用完成"
+
     - name: 织入 KernelSU
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
@@ -108,8 +119,8 @@ jobs:
           -e SHADOW_CALL_STACK -d KASAN_GENERIC -d KASAN_SW_TAGS -e KASAN_HW_TAGS
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
         echo "===== 容器与 KSU 配置最终状态 ====="
-        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|DEVTMPFS|KSU|CFS_BANDWIDTH|CGROUP_DEVICE|CGROUP_PIDS)(=| is)' out/.config
-        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS DEVTMPFS KSU; do
+        grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|DEVTMPFS|KSU|NTSYNC|CFS_BANDWIDTH|CGROUP_DEVICE|CGROUP_PIDS)(=| is)' out/.config
+        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS DEVTMPFS KSU NTSYNC; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "配置 ${c} 未能开启"; exit 1; }
         done
         # 以下配置必须保持关闭：都会改变 vendor 模块内联读取的结构体布局
