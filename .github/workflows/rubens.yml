@@ -87,6 +87,15 @@ jobs:
         grep -q 'ntsync.o' drivers/misc/Makefile
         echo "NTsync 补丁应用完成"
 
+    - name: 打 CPU 限额/pids cgroup 补丁（kABI 布局保全，实验性）
+      run: |
+        cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
+        git apply $GITHUB_WORKSPACE/patches/cpu-pids/kabi-cfs-bandwidth-cgroup-pids-5.10.patch
+        grep -q 'struct cfs_bandwidth_state' kernel/sched/sched.h
+        grep -q 'css_set_pids_storage' kernel/cgroup/cgroup.c
+        grep -q 'css_set_subsys(cset, pids_cgrp_id)' kernel/cgroup/pids.c
+        echo "CPU/PIDS kABI 补丁应用完成"
+
     - name: 织入 KernelSU
       run: |
         cd $GITHUB_WORKSPACE/kernel_workspace/android-kernel
@@ -120,14 +129,12 @@ jobs:
         make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
         echo "===== 容器与 KSU 配置最终状态 ====="
         grep -E 'CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|UTS_NS|NET_NS|USER_NS|DEVTMPFS|KSU|NTSYNC|CFS_BANDWIDTH|CGROUP_DEVICE|CGROUP_PIDS)(=| is)' out/.config
-        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS DEVTMPFS KSU NTSYNC; do
+        for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS UTS_NS NET_NS USER_NS DEVTMPFS KSU NTSYNC CFS_BANDWIDTH CGROUP_PIDS; do
           grep -q "CONFIG_${c}=y" out/.config || { echo "配置 ${c} 未能开启"; exit 1; }
         done
-        # 以下配置必须保持关闭：都会改变 vendor 模块内联读取的结构体布局
-        # CFS_BANDWIDTH 挪动 struct rq；CGROUP_DEVICE/PIDS 增大 CGROUP_SUBSYS_COUNT，
-        # 挪动 css_set->subsys[] 数组与各子系统索引。
-        for c in CFS_BANDWIDTH CGROUP_DEVICE CGROUP_PIDS; do
-          grep -q "CONFIG_${c} is not set" out/.config || { echo "${c} 未保持关闭（会破坏 struct rq / css_set 布局）"; exit 1; }
+        # CGROUP_DEVICE 仍必须关闭：kABI 布局保全补丁未覆盖 device 子系统。
+        for c in CGROUP_DEVICE; do
+          grep -q "CONFIG_${c} is not set" out/.config || { echo "${c} 未保持关闭"; exit 1; }
         done
         echo "===== 模块兼容强化配置（必须与原厂一致）====="
         for c in LTO_CLANG_THIN CFI_CLANG SHADOW_CALL_STACK KASAN_HW_TAGS MODVERSIONS MODULE_UNLOAD; do

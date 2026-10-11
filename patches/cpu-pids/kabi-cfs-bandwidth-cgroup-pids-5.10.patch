@@ -1,0 +1,1487 @@
+diff --git a/include/linux/cgroup-defs.h b/include/linux/cgroup-defs.h
+index 3ee42f1..15c3b81 100644
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -40,12 +40,26 @@ struct poll_table_struct;
+ 
+ /* define the enumeration of all cgroup subsystems */
+ #define SUBSYS(_x) _x ## _cgrp_id,
++#define CGROUP_SUBSYS_KABI
+ enum cgroup_subsys_id {
+ #include <linux/cgroup_subsys.h>
+ 	CGROUP_SUBSYS_COUNT,
+ };
++#undef CGROUP_SUBSYS_KABI
+ #undef SUBSYS
+ 
++/*
++ * Keep the original IDs and array bounds when enabling PIDS on a kernel
++ * whose Android KMI was frozen with CONFIG_CGROUP_PIDS=n.  Only cgroup core
++ * walks the extra runtime slot; ABI-visible arrays retain their old bounds.
++ */
++#ifdef CONFIG_CGROUP_PIDS
++enum { pids_cgrp_id = CGROUP_SUBSYS_COUNT };
++#define CGROUP_SUBSYS_COUNT_ACTIVE (CGROUP_SUBSYS_COUNT + 1)
++#else
++#define CGROUP_SUBSYS_COUNT_ACTIVE CGROUP_SUBSYS_COUNT
++#endif
++
+ /* bits in struct cgroup_subsys_state flags field */
+ enum {
+ 	CSS_NO_REF	= (1 << 0), /* no reference counting for this css */
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 3c0b5b3..1f0b173 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -80,6 +80,20 @@ extern struct ext_css_set init_ext_css_set;
+ #include <linux/cgroup_subsys.h>
+ #undef SUBSYS
+ 
++#ifdef CONFIG_CGROUP_PIDS
++struct cgroup_subsys_state *css_set_pids(struct css_set *cset);
++#endif
++
++static inline struct cgroup_subsys_state *
++css_set_subsys(struct css_set *cset, int ssid)
++{
++#ifdef CONFIG_CGROUP_PIDS
++	if (ssid == pids_cgrp_id)
++		return css_set_pids(cset);
++#endif
++	return cset->subsys[ssid];
++}
++
+ #define SUBSYS(_x)								\
+ 	extern struct static_key_true _x ## _cgrp_subsys_enabled_key;		\
+ 	extern struct static_key_true _x ## _cgrp_subsys_on_dfl_key;
+@@ -474,7 +488,7 @@ extern spinlock_t css_set_lock;
+  * synchronization rules are the same as task_css_set_check().
+  */
+ #define task_css_check(task, subsys_id, __c)				\
+-	task_css_set_check((task), (__c))->subsys[(subsys_id)]
++	css_set_subsys(task_css_set_check((task), (__c)), (subsys_id))
+ 
+ /**
+  * task_css_set - obtain a task's css_set
+@@ -542,7 +556,7 @@ task_get_css(struct task_struct *task, int subsys_id)
+ static inline bool task_css_is_root(struct task_struct *task, int subsys_id)
+ {
+ 	return task_css_check(task, subsys_id, true) ==
+-		init_css_set.subsys[subsys_id];
++		css_set_subsys(&init_css_set, subsys_id);
+ }
+ 
+ static inline struct cgroup *task_cgroup(struct task_struct *task,
+diff --git a/include/linux/cgroup_subsys.h b/include/linux/cgroup_subsys.h
+index acb77dc..529e78a 100644
+--- a/include/linux/cgroup_subsys.h
++++ b/include/linux/cgroup_subsys.h
+@@ -53,10 +53,6 @@ SUBSYS(net_prio)
+ SUBSYS(hugetlb)
+ #endif
+ 
+-#if IS_ENABLED(CONFIG_CGROUP_PIDS)
+-SUBSYS(pids)
+-#endif
+-
+ #if IS_ENABLED(CONFIG_CGROUP_RDMA)
+ SUBSYS(rdma)
+ #endif
+@@ -68,6 +64,14 @@ SUBSYS(rdma)
+ SUBSYS(debug)
+ #endif
+ 
++/*
++ * PIDS is appended after the frozen Android subsystem IDs.  Its state is
++ * kept out of the ABI-visible per-subsystem arrays; see cgroup-defs.h.
++ */
++#if IS_ENABLED(CONFIG_CGROUP_PIDS) && !defined(CGROUP_SUBSYS_KABI)
++SUBSYS(pids)
++#endif
++
+ /*
+  * DO NOT ADD ANY SUBSYSTEM WITHOUT EXPLICIT ACKS FROM CGROUP MAINTAINERS.
+  */
+diff --git a/kernel/cgroup/cgroup-internal.h b/kernel/cgroup/cgroup-internal.h
+index 4307a09..8b7e29e 100644
+--- a/kernel/cgroup/cgroup-internal.h
++++ b/kernel/cgroup/cgroup-internal.h
+@@ -9,6 +9,20 @@
+ #include <linux/refcount.h>
+ #include <linux/fs_parser.h>
+ 
++/* Private tail storage, never part of an Android KMI-visible structure. */
++#ifdef CONFIG_CGROUP_PIDS
++struct cgroup_pids_kabi {
++	struct cgroup_subsys_state __rcu *subsys;
++	struct list_head e_csets;
++};
++#define CGROUP_PIDS_KABI_SIZE sizeof(struct cgroup_pids_kabi)
++#else
++#define CGROUP_PIDS_KABI_SIZE 0
++#endif
++
++struct cgroup_subsys_state __rcu **
++cgroup_subsys_slot(struct cgroup *cgrp, int ssid);
++
+ #define TRACE_CGROUP_PATH_LEN 1024
+ extern spinlock_t trace_cgroup_path_lock;
+ extern char trace_cgroup_path[TRACE_CGROUP_PATH_LEN];
+@@ -177,10 +191,10 @@ extern struct list_head cgroup_roots;
+ /**
+  * for_each_subsys - iterate all enabled cgroup subsystems
+  * @ss: the iteration cursor
+- * @ssid: the index of @ss, CGROUP_SUBSYS_COUNT after reaching the end
++ * @ssid: the index of @ss, CGROUP_SUBSYS_COUNT_ACTIVE after reaching the end
+  */
+ #define for_each_subsys(ss, ssid)					\
+-	for ((ssid) = 0; (ssid) < CGROUP_SUBSYS_COUNT &&		\
++	for ((ssid) = 0; (ssid) < CGROUP_SUBSYS_COUNT_ACTIVE &&	\
+ 	     (((ss) = cgroup_subsys[ssid]) || true); (ssid)++)
+ 
+ static inline bool cgroup_is_dead(const struct cgroup *cgrp)
+diff --git a/kernel/cgroup/cgroup-v1.c b/kernel/cgroup/cgroup-v1.c
+index 3a5941c..6bb165b 100644
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@ -1214,7 +1214,7 @@ static int cgroup1_root_to_use(struct fs_context *fc)
+ 	if (ctx->ns != &init_cgroup_ns)
+ 		return -EPERM;
+ 
+-	root = kzalloc(sizeof(*root), GFP_KERNEL);
++	root = kzalloc(sizeof(*root) + CGROUP_PIDS_KABI_SIZE, GFP_KERNEL);
+ 	if (!root)
+ 		return -ENOMEM;
+ 
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 193f092..43b1912 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -155,6 +155,105 @@ static struct static_key_true *cgroup_subsys_on_dfl_key[] = {
+ };
+ #undef SUBSYS
+ 
++#ifdef CONFIG_CGROUP_PIDS
++struct css_set_pids_kabi {
++	struct cgroup_subsys_state *subsys;
++	struct list_head e_cset_node;
++};
++
++/* The two boot-time objects are static and therefore have no allocation tail. */
++static struct css_set_pids_kabi init_css_set_pids;
++static struct cgroup_pids_kabi cgrp_dfl_root_pids;
++
++static struct css_set_pids_kabi *css_set_pids_storage(struct css_set *cset)
++{
++	if (cset == &init_css_set)
++		return &init_css_set_pids;
++	/* struct css_set is the first member of the GKI ext_css_set wrapper. */
++	return (struct css_set_pids_kabi *)((struct ext_css_set *)cset + 1);
++}
++
++/*
++ * Dynamic roots allocate the extension after struct cgroup_root.  Other
++ * cgroups allocate it after the full object and its ancestor_ids[] storage.
++ * Both root and level must therefore be set before
++ * init_cgroup_housekeeping().  These tails share their owner's allocation
++ * and RCU lifetime.
++ */
++static struct cgroup_pids_kabi *cgroup_pids_storage(struct cgroup *cgrp)
++{
++	if (cgrp == &cgrp_dfl_root.cgrp)
++		return &cgrp_dfl_root_pids;
++	if (!cgrp->level)
++		return (struct cgroup_pids_kabi *)(cgrp->root + 1);
++	return (struct cgroup_pids_kabi *)((char *)cgrp +
++		struct_size(cgrp, ancestor_ids, cgrp->level + 1));
++}
++
++struct cgroup_subsys_state *css_set_pids(struct css_set *cset)
++{
++	return css_set_pids_storage(cset)->subsys;
++}
++EXPORT_SYMBOL_GPL(css_set_pids);
++
++#define CSS_SET_PIDS_KABI_SIZE sizeof(struct css_set_pids_kabi)
++#else
++#define CSS_SET_PIDS_KABI_SIZE 0
++#endif
++
++static struct cgroup_subsys_state **css_set_subsys_slot(struct css_set *cset,
++							int ssid)
++{
++#ifdef CONFIG_CGROUP_PIDS
++	if (ssid == pids_cgrp_id)
++		return &css_set_pids_storage(cset)->subsys;
++#endif
++	return &cset->subsys[ssid];
++}
++
++struct cgroup_subsys_state __rcu **
++cgroup_subsys_slot(struct cgroup *cgrp, int ssid)
++{
++#ifdef CONFIG_CGROUP_PIDS
++	if (ssid == pids_cgrp_id)
++		return &cgroup_pids_storage(cgrp)->subsys;
++#endif
++	return &cgrp->subsys[ssid];
++}
++
++static struct list_head *css_set_e_cset_node(struct css_set *cset, int ssid)
++{
++#ifdef CONFIG_CGROUP_PIDS
++	if (ssid == pids_cgrp_id)
++		return &css_set_pids_storage(cset)->e_cset_node;
++#endif
++	return &cset->e_cset_node[ssid];
++}
++
++static struct css_set *css_set_from_e_cset_node(struct list_head *node, int ssid)
++{
++#ifdef CONFIG_CGROUP_PIDS
++	if (ssid == pids_cgrp_id) {
++		struct css_set_pids_kabi *pids;
++
++		pids = container_of(node, struct css_set_pids_kabi, e_cset_node);
++		if (pids == &init_css_set_pids)
++			return &init_css_set;
++		return &((struct ext_css_set *)pids - 1)->cset;
++	}
++#endif
++	return container_of(node, struct css_set, e_cset_node[ssid]);
++}
++
++static struct list_head *cgroup_e_csets(struct cgroup *cgrp, int ssid)
++{
++#ifdef CONFIG_CGROUP_PIDS
++	if (ssid == pids_cgrp_id)
++		return &cgroup_pids_storage(cgrp)->e_csets;
++#endif
++	return &cgrp->e_csets[ssid];
++}
++
+ static DEFINE_PER_CPU(struct cgroup_rstat_cpu, cgrp_dfl_root_rstat_cpu);
+ 
+ /* the default hierarchy */
+@@ -480,7 +579,7 @@ static struct cgroup_subsys_state *cgroup_css(struct cgroup *cgrp,
+ 					      struct cgroup_subsys *ss)
+ {
+ 	if (ss)
+-		return rcu_dereference_check(cgrp->subsys[ss->id],
++		return rcu_dereference_check(*cgroup_subsys_slot(cgrp, ss->id),
+ 					lockdep_is_held(&cgroup_mutex));
+ 	else
+ 		return &cgrp->self;
+@@ -565,7 +664,7 @@ struct cgroup_subsys_state *cgroup_e_css(struct cgroup *cgrp,
+ 		cgrp = cgroup_parent(cgrp);
+ 	} while (cgrp);
+ 
+-	return init_css_set.subsys[ss->id];
++	return css_set_subsys(&init_css_set, ss->id);
+ }
+ 
+ /**
+@@ -594,7 +693,7 @@ struct cgroup_subsys_state *cgroup_get_e_css(struct cgroup *cgrp,
+ 		cgrp = cgroup_parent(cgrp);
+ 	} while (cgrp);
+ 
+-	css = init_css_set.subsys[ss->id];
++	css = css_set_subsys(&init_css_set, ss->id);
+ 	css_get(css);
+ out_unlock:
+ 	rcu_read_unlock();
+@@ -654,7 +753,7 @@ struct cgroup_subsys_state *of_css(struct kernfs_open_file *of)
+ 	 * be and stay valid until the enclosing operation is complete.
+ 	 */
+ 	if (cft->ss)
+-		return rcu_dereference_raw(cgrp->subsys[cft->ss->id]);
++		return rcu_dereference_raw(*cgroup_subsys_slot(cgrp, cft->ss->id));
+ 	else
+ 		return &cgrp->self;
+ }
+@@ -669,9 +768,9 @@ EXPORT_SYMBOL_GPL(of_css);
+  * Should be called under cgroup_[tree_]mutex.
+  */
+ #define for_each_css(css, ssid, cgrp)					\
+-	for ((ssid) = 0; (ssid) < CGROUP_SUBSYS_COUNT; (ssid)++)	\
++	for ((ssid) = 0; (ssid) < CGROUP_SUBSYS_COUNT_ACTIVE; (ssid)++)	\
+ 		if (!((css) = rcu_dereference_check(			\
+-				(cgrp)->subsys[(ssid)],			\
++				*cgroup_subsys_slot((cgrp), (ssid)),	\
+ 				lockdep_is_held(&cgroup_mutex)))) { }	\
+ 		else
+ 
+@@ -684,7 +783,7 @@ EXPORT_SYMBOL_GPL(of_css);
+  * Should be called under cgroup_[tree_]mutex.
+  */
+ #define for_each_e_css(css, ssid, cgrp)					    \
+-	for ((ssid) = 0; (ssid) < CGROUP_SUBSYS_COUNT; (ssid)++)	    \
++	for ((ssid) = 0; (ssid) < CGROUP_SUBSYS_COUNT_ACTIVE; (ssid)++)	    \
+ 		if (!((css) = cgroup_e_css_by_mask(cgrp,		    \
+ 						   cgroup_subsys[(ssid)]))) \
+ 			;						    \
+@@ -701,11 +800,11 @@ EXPORT_SYMBOL_GPL(of_css);
+  */
+ #define do_each_subsys_mask(ss, ssid, ss_mask) do {			\
+ 	unsigned long __ss_mask = (ss_mask);				\
+-	if (!CGROUP_SUBSYS_COUNT) { /* to avoid spurious gcc warning */	\
++	if (!CGROUP_SUBSYS_COUNT_ACTIVE) { /* to avoid gcc warning */	\
+ 		(ssid) = 0;						\
+ 		break;							\
+ 	}								\
+-	for_each_set_bit(ssid, &__ss_mask, CGROUP_SUBSYS_COUNT) {	\
++	for_each_set_bit(ssid, &__ss_mask, CGROUP_SUBSYS_COUNT_ACTIVE) { \
+ 		(ss) = cgroup_subsys[ssid];				\
+ 		{
+ 
+@@ -933,14 +1032,19 @@ static void css_set_move_task(struct task_struct *task,
+ #define CSS_SET_HASH_BITS	7
+ static DEFINE_HASHTABLE(css_set_table, CSS_SET_HASH_BITS);
+ 
+-static unsigned long css_set_hash(struct cgroup_subsys_state *css[])
++static unsigned long css_set_hash(struct css_set *cset,
++				  struct cgroup_subsys_state *css[])
+ {
+ 	unsigned long key = 0UL;
+ 	struct cgroup_subsys *ss;
+ 	int i;
+ 
+-	for_each_subsys(ss, i)
+-		key += (unsigned long)css[i];
++	for_each_subsys(ss, i) {
++		if (css)
++			key += (unsigned long)css[i];
++		else
++			key += (unsigned long)css_set_subsys(cset, i);
++	}
+ 	key = (key >> 16) ^ key;
+ 
+ 	return key;
+@@ -961,8 +1065,8 @@ void put_css_set_locked(struct css_set *cset)
+ 
+ 	/* This css_set is dead. unlink it and release cgroup and css refs */
+ 	for_each_subsys(ss, ssid) {
+-		list_del(&cset->e_cset_node[ssid]);
+-		css_put(cset->subsys[ssid]);
++		list_del(css_set_e_cset_node(cset, ssid));
++		css_put(css_set_subsys(cset, ssid));
+ 	}
+ 	hash_del(&cset->hlist);
+ 	css_set_count--;
+@@ -1006,8 +1110,14 @@ static bool compare_css_sets(struct css_set *cset,
+ 	 * associated with the same set of cgroups but different csses.
+ 	 * Let's first ensure that csses match.
+ 	 */
+-	if (memcmp(template, cset->subsys, sizeof(cset->subsys)))
+-		return false;
++	{
++		struct cgroup_subsys *ss;
++		int ssid;
++
++		for_each_subsys(ss, ssid)
++			if (template[ssid] != css_set_subsys(cset, ssid))
++				return false;
++	}
+ 
+ 
+ 	/* @cset's domain should match the default cgroup's */
+@@ -1099,11 +1209,11 @@ static struct css_set *find_existing_css_set(struct css_set *old_cset,
+ 			 * @ss is not in this hierarchy, so we don't want
+ 			 * to change the css.
+ 			 */
+-			template[i] = old_cset->subsys[i];
++			template[i] = css_set_subsys(old_cset, i);
+ 		}
+ 	}
+ 
+-	key = css_set_hash(template);
++	key = css_set_hash(NULL, template);
+ 	hash_for_each_possible(css_set_table, cset, hlist, key) {
+ 		if (!compare_css_sets(cset, old_cset, cgrp, template))
+ 			continue;
+@@ -1194,7 +1304,7 @@ static void link_css_set(struct list_head *tmp_links, struct css_set *cset,
+ static struct css_set *find_css_set(struct css_set *old_cset,
+ 				    struct cgroup *cgrp)
+ {
+-	struct cgroup_subsys_state *template[CGROUP_SUBSYS_COUNT] = { };
++	struct cgroup_subsys_state *template[CGROUP_SUBSYS_COUNT_ACTIVE] = { };
+ 	struct ext_css_set *ext_cset;
+ 	struct css_set *cset;
+ 	struct list_head tmp_links;
+@@ -1216,7 +1326,8 @@ static struct css_set *find_css_set(struct css_set *old_cset,
+ 	if (cset)
+ 		return cset;
+ 
+-	ext_cset = kzalloc(sizeof(*ext_cset), GFP_KERNEL);
++	ext_cset = kzalloc(sizeof(*ext_cset) + CSS_SET_PIDS_KABI_SIZE,
++			   GFP_KERNEL);
+ 	if (!ext_cset)
+ 		return NULL;
+ 	cset = &ext_cset->cset;
+@@ -1243,7 +1354,12 @@ static struct css_set *find_css_set(struct css_set *old_cset,
+ 
+ 	/* Copy the set of subsystem state objects generated in
+ 	 * find_existing_css_set() */
+-	memcpy(cset->subsys, template, sizeof(cset->subsys));
++	{
++		int i;
++
++		for (i = 0; i < CGROUP_SUBSYS_COUNT_ACTIVE; i++)
++			*css_set_subsys_slot(cset, i) = template[i];
++	}
+ 
+ 	spin_lock_irq(&css_set_lock);
+ 	/* Add reference counts and links from the new css_set. */
+@@ -1260,14 +1376,14 @@ static struct css_set *find_css_set(struct css_set *old_cset,
+ 	css_set_count++;
+ 
+ 	/* Add @cset to the hash table */
+-	key = css_set_hash(cset->subsys);
++	key = css_set_hash(cset, NULL);
+ 	hash_add(css_set_table, &cset->hlist, key);
+ 
+ 	for_each_subsys(ss, ssid) {
+-		struct cgroup_subsys_state *css = cset->subsys[ssid];
++		struct cgroup_subsys_state *css = css_set_subsys(cset, ssid);
+ 
+-		list_add_tail(&cset->e_cset_node[ssid],
+-			      &css->cgroup->e_csets[ssid]);
++		list_add_tail(css_set_e_cset_node(cset, ssid),
++			      cgroup_e_csets(css->cgroup, ssid));
+ 		css_get(css);
+ 	}
+ 
+@@ -1781,8 +1897,9 @@ int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
+ 		struct cgroup_root *src_root = ss->root;
+ 		struct cgroup *scgrp = &src_root->cgrp;
+ 		struct cgroup_subsys_state *css = cgroup_css(scgrp, ss);
+-		struct css_set *cset, *cset_pos;
++		struct css_set *cset;
+ 		struct css_task_iter *it;
++		struct list_head *head, *pos, *next;
+ 
+ 		WARN_ON(!css || cgroup_css(dcgrp, ss));
+ 
+@@ -1794,17 +1911,19 @@ int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
+ 		}
+ 
+ 		/* rebind */
+-		RCU_INIT_POINTER(scgrp->subsys[ssid], NULL);
+-		rcu_assign_pointer(dcgrp->subsys[ssid], css);
++		RCU_INIT_POINTER(*cgroup_subsys_slot(scgrp, ssid), NULL);
++		rcu_assign_pointer(*cgroup_subsys_slot(dcgrp, ssid), css);
+ 		ss->root = dst_root;
+ 		css->cgroup = dcgrp;
+ 
+ 		spin_lock_irq(&css_set_lock);
+-		WARN_ON(!list_empty(&dcgrp->e_csets[ss->id]));
+-		list_for_each_entry_safe(cset, cset_pos, &scgrp->e_csets[ss->id],
+-					 e_cset_node[ss->id]) {
+-			list_move_tail(&cset->e_cset_node[ss->id],
+-				       &dcgrp->e_csets[ss->id]);
++		WARN_ON(!list_empty(cgroup_e_csets(dcgrp, ss->id)));
++		head = cgroup_e_csets(scgrp, ss->id);
++		for (pos = head->next; pos != head; pos = next) {
++			next = pos->next;
++			cset = css_set_from_e_cset_node(pos, ss->id);
++			list_move_tail(css_set_e_cset_node(cset, ss->id),
++				       cgroup_e_csets(dcgrp, ss->id));
+ 			/*
+ 			 * all css_sets of scgrp together in same order to dcgrp,
+ 			 * patch in-flight iterators to preserve correct iteration.
+@@ -1813,8 +1932,8 @@ int rebind_subsystems(struct cgroup_root *dst_root, u16 ss_mask)
+ 			 * update it->cset_head is enough here.
+ 			 */
+ 			list_for_each_entry(it, &cset->task_iters, iters_node)
+-				if (it->cset_head == &scgrp->e_csets[ss->id])
+-					it->cset_head = &dcgrp->e_csets[ss->id];
++				if (it->cset_head == cgroup_e_csets(scgrp, ss->id))
++					it->cset_head = cgroup_e_csets(dcgrp, ss->id);
+ 		}
+ 		spin_unlock_irq(&css_set_lock);
+ 
+@@ -1963,7 +2082,7 @@ static void init_cgroup_housekeeping(struct cgroup *cgrp)
+ 	prev_cputime_init(&cgrp->prev_cputime);
+ 
+ 	for_each_subsys(ss, ssid)
+-		INIT_LIST_HEAD(&cgrp->e_csets[ssid]);
++		INIT_LIST_HEAD(cgroup_e_csets(cgrp, ssid));
+ 
+ 	init_waitqueue_head(&cgrp->offline_waitq);
+ 	INIT_WORK(&cgrp->release_agent_work, cgroup1_release_agent);
+@@ -2472,9 +2591,9 @@ struct task_struct *cgroup_taskset_next(struct cgroup_taskset *tset,
+ 			 * has its ->mg_dst_cset set.
+ 			 */
+ 			if (cset->mg_dst_cset)
+-				*dst_cssp = cset->mg_dst_cset->subsys[tset->ssid];
++				*dst_cssp = css_set_subsys(cset->mg_dst_cset, tset->ssid);
+ 			else
+-				*dst_cssp = cset->subsys[tset->ssid];
++				*dst_cssp = css_set_subsys(cset, tset->ssid);
+ 
+ 			return task;
+ 		}
+@@ -2778,7 +2897,8 @@ int cgroup_migrate_prepare_dst(struct cgroup_mgctx *mgctx)
+ 			put_css_set(dst_cset);
+ 
+ 		for_each_subsys(ss, ssid)
+-			if (src_cset->subsys[ssid] != dst_cset->subsys[ssid])
++			if (css_set_subsys(src_cset, ssid) !=
++			    css_set_subsys(dst_cset, ssid))
+ 				mgctx->ss_mask |= 1 << ssid;
+ 	}
+ 
+@@ -3372,7 +3492,7 @@ static ssize_t cgroup_subtree_control_write(struct kernfs_open_file *of,
+ 			}
+ 			break;
+ 		} while_each_subsys_mask();
+-		if (ssid == CGROUP_SUBSYS_COUNT)
++		if (ssid == CGROUP_SUBSYS_COUNT_ACTIVE)
+ 			return -EINVAL;
+ 	}
+ 
+@@ -4539,7 +4659,7 @@ static struct css_set *css_task_iter_next_css_set(struct css_task_iter *it)
+ 	}
+ 
+ 	if (it->ss) {
+-		cset = container_of(l, struct css_set, e_cset_node[it->ss->id]);
++		cset = css_set_from_e_cset_node(l, it->ss->id);
+ 	} else {
+ 		link = list_entry(l, struct cgrp_cset_link, cset_link);
+ 		cset = link->cset;
+@@ -4702,7 +4822,7 @@ void css_task_iter_start(struct cgroup_subsys_state *css, unsigned int flags,
+ 	it->flags = flags;
+ 
+ 	if (it->ss)
+-		it->cset_pos = &css->cgroup->e_csets[css->ss->id];
++		it->cset_pos = cgroup_e_csets(css->cgroup, css->ss->id);
+ 	else
+ 		it->cset_pos = &css->cgroup->cset_links;
+ 
+@@ -5277,7 +5397,7 @@ static int online_css(struct cgroup_subsys_state *css)
+ 		ret = ss->css_online(css);
+ 	if (!ret) {
+ 		css->flags |= CSS_ONLINE;
+-		rcu_assign_pointer(css->cgroup->subsys[ss->id], css);
++		rcu_assign_pointer(*cgroup_subsys_slot(css->cgroup, ss->id), css);
+ 
+ 		atomic_inc(&css->online_cnt);
+ 		if (css->parent)
+@@ -5300,7 +5420,7 @@ static void offline_css(struct cgroup_subsys_state *css)
+ 		ss->css_offline(css);
+ 
+ 	css->flags &= ~CSS_ONLINE;
+-	RCU_INIT_POINTER(css->cgroup->subsys[ss->id], NULL);
++	RCU_INIT_POINTER(*cgroup_subsys_slot(css->cgroup, ss->id), NULL);
+ 
+ 	wake_up_all(&css->cgroup->offline_waitq);
+ }
+@@ -5384,8 +5504,8 @@ static struct cgroup *cgroup_create(struct cgroup *parent, const char *name,
+ 	int ret;
+ 
+ 	/* allocate the cgroup and its ID, 0 is reserved for the root */
+-	cgrp = kzalloc(struct_size(cgrp, ancestor_ids, (level + 1)),
+-		       GFP_KERNEL);
++	cgrp = kzalloc(struct_size(cgrp, ancestor_ids, (level + 1)) +
++		       CGROUP_PIDS_KABI_SIZE, GFP_KERNEL);
+ 	if (!cgrp)
+ 		return ERR_PTR(-ENOMEM);
+ 
+@@ -5407,12 +5527,12 @@ static struct cgroup *cgroup_create(struct cgroup *parent, const char *name,
+ 	}
+ 	cgrp->kn = kn;
+ 
+-	init_cgroup_housekeeping(cgrp);
+-
+ 	cgrp->self.parent = &parent->self;
+ 	cgrp->root = root;
+ 	cgrp->level = level;
+ 
++	init_cgroup_housekeeping(cgrp);
++
+ 	ret = psi_cgroup_alloc(cgrp);
+ 	if (ret)
+ 		goto out_kernfs_remove;
+@@ -5806,7 +5926,7 @@ static void __init cgroup_init_subsys(struct cgroup_subsys *ss, bool early)
+ 	 * pointer to this state - since the subsystem is
+ 	 * newly registered, all tasks and hence the
+ 	 * init_css_set is in the subsystem's root cgroup. */
+-	init_css_set.subsys[ss->id] = css;
++	*css_set_subsys_slot(&init_css_set, ss->id) = css;
+ 
+ 	have_fork_callback |= (bool)ss->fork << ss->id;
+ 	have_exit_callback |= (bool)ss->exit << ss->id;
+@@ -5871,7 +5991,7 @@ int __init cgroup_init(void)
+ 	struct cgroup_subsys *ss;
+ 	int ssid;
+ 
+-	BUILD_BUG_ON(CGROUP_SUBSYS_COUNT > 16);
++	BUILD_BUG_ON(CGROUP_SUBSYS_COUNT_ACTIVE > 16);
+ 	BUG_ON(cgroup_init_cftypes(NULL, cgroup_base_files));
+ 	BUG_ON(cgroup_init_cftypes(NULL, cgroup1_base_files));
+ 
+@@ -5892,7 +6012,7 @@ int __init cgroup_init(void)
+ 	 * it during init.
+ 	 */
+ 	hash_add(css_set_table, &init_css_set.hlist,
+-		 css_set_hash(init_css_set.subsys));
++		 css_set_hash(&init_css_set, NULL));
+ 
+ 	BUG_ON(cgroup_setup_root(&cgrp_dfl_root, 0));
+ 
+@@ -5901,7 +6021,7 @@ int __init cgroup_init(void)
+ 	for_each_subsys(ss, ssid) {
+ 		if (ss->early_init) {
+ 			struct cgroup_subsys_state *css =
+-				init_css_set.subsys[ss->id];
++				css_set_subsys(&init_css_set, ss->id);
+ 
+ 			css->id = cgroup_idr_alloc(&ss->css_idr, css, 1, 2,
+ 						   GFP_KERNEL);
+@@ -5910,8 +6030,8 @@ int __init cgroup_init(void)
+ 			cgroup_init_subsys(ss, false);
+ 		}
+ 
+-		list_add_tail(&init_css_set.e_cset_node[ssid],
+-			      &cgrp_dfl_root.cgrp.e_csets[ssid]);
++		list_add_tail(css_set_e_cset_node(&init_css_set, ssid),
++			      cgroup_e_csets(&cgrp_dfl_root.cgrp, ssid));
+ 
+ 		/*
+ 		 * Setting dfl_root subsys_mask needs to consider the
+@@ -5946,17 +6066,17 @@ int __init cgroup_init(void)
+ 		}
+ 
+ 		if (ss->bind)
+-			ss->bind(init_css_set.subsys[ssid]);
++			ss->bind(css_set_subsys(&init_css_set, ssid));
+ 
+ 		mutex_lock(&cgroup_mutex);
+-		css_populate_dir(init_css_set.subsys[ssid]);
++		css_populate_dir(css_set_subsys(&init_css_set, ssid));
+ 		mutex_unlock(&cgroup_mutex);
+ 	}
+ 
+ 	/* init_css_set.subsys[] has been updated, re-hash */
+ 	hash_del(&init_css_set.hlist);
+ 	hash_add(css_set_table, &init_css_set.hlist,
+-		 css_set_hash(init_css_set.subsys));
++		 css_set_hash(&init_css_set, NULL));
+ 
+ 	WARN_ON(sysfs_create_mount_point(fs_kobj, "cgroup"));
+ 	WARN_ON(register_filesystem(&cgroup_fs_type));
+diff --git a/kernel/cgroup/debug.c b/kernel/cgroup/debug.c
+index 80aa3f0..d414fc4 100644
+--- a/kernel/cgroup/debug.c
++++ b/kernel/cgroup/debug.c
+@@ -61,7 +61,7 @@ static int current_css_set_read(struct seq_file *seq, void *v)
+ 	 * Print the css'es stored in the current css_set.
+ 	 */
+ 	for_each_subsys(ss, i) {
+-		css = cset->subsys[ss->id];
++		css = css_set_subsys(cset, ss->id);
+ 		if (!css)
+ 			continue;
+ 		seq_printf(seq, "%2d: %-4s\t- %p[%d]\n", ss->id, ss->name,
+@@ -214,7 +214,7 @@ static int cgroup_subsys_states_read(struct seq_file *seq, void *v)
+ 		return -ENODEV;
+ 
+ 	for_each_subsys(ss, i) {
+-		css = rcu_dereference_check(cgrp->subsys[ss->id], true);
++		css = rcu_dereference_check(*cgroup_subsys_slot(cgrp, ss->id), true);
+ 		if (!css)
+ 			continue;
+ 
+diff --git a/kernel/cgroup/pids.c b/kernel/cgroup/pids.c
+index 511af87..a010597 100644
+--- a/kernel/cgroup/pids.c
++++ b/kernel/cgroup/pids.c
+@@ -222,7 +222,7 @@ static int pids_can_fork(struct task_struct *task, struct css_set *cset)
+ 	int err;
+ 
+ 	if (cset)
+-		css = cset->subsys[pids_cgrp_id];
++		css = css_set_subsys(cset, pids_cgrp_id);
+ 	else
+ 		css = task_css_check(current, pids_cgrp_id, true);
+ 	pids = css_pids(css);
+@@ -245,7 +245,7 @@ static void pids_cancel_fork(struct task_struct *task, struct css_set *cset)
+ 	struct pids_cgroup *pids;
+ 
+ 	if (cset)
+-		css = cset->subsys[pids_cgrp_id];
++		css = css_set_subsys(cset, pids_cgrp_id);
+ 	else
+ 		css = task_css_check(current, pids_cgrp_id, true);
+ 	pids = css_pids(css);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 7bcead2..42b726c 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -7489,7 +7489,7 @@ void __init sched_init(void)
+ 		ptr += nr_cpu_ids * sizeof(void **);
+ 
+ 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
+-		init_cfs_bandwidth(&root_task_group.cfs_bandwidth);
++		init_root_cfs_bandwidth();
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 		root_task_group.rt_se = (struct sched_rt_entity **)ptr;
+@@ -7522,7 +7522,10 @@ void __init sched_init(void)
+ #endif /* CONFIG_RT_GROUP_SCHED */
+ 
+ #ifdef CONFIG_CGROUP_SCHED
+-	task_group_cache = KMEM_CACHE(task_group, 0);
++	task_group_cache = kmem_cache_create("task_group",
++					    sizeof(struct task_group_allocation),
++					    __alignof__(struct task_group_allocation),
++					    0, NULL);
+ 
+ 	list_add(&root_task_group.list, &task_groups);
+ 	INIT_LIST_HEAD(&root_task_group.children);
+@@ -8332,7 +8335,7 @@ static int __cfs_schedulable(struct task_group *tg, u64 period, u64 runtime);
+ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ {
+ 	int i, ret = 0, runtime_enabled, runtime_was_enabled;
+-	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(tg);
+ 
+ 	if (tg == &root_task_group)
+ 		return -EINVAL;
+@@ -8395,10 +8398,10 @@ static int tg_set_cfs_bandwidth(struct task_group *tg, u64 period, u64 quota)
+ 		struct rq_flags rf;
+ 
+ 		rq_lock_irq(rq, &rf);
+-		cfs_rq->runtime_enabled = runtime_enabled;
+-		cfs_rq->runtime_remaining = 0;
++		cfs_rq_bw(cfs_rq)->runtime_enabled = runtime_enabled;
++		cfs_rq_bw(cfs_rq)->runtime_remaining = 0;
+ 
+-		if (cfs_rq->throttled)
++		if (cfs_rq_bw(cfs_rq)->throttled)
+ 			unthrottle_cfs_rq(cfs_rq);
+ 		rq_unlock_irq(rq, &rf);
+ 	}
+@@ -8415,7 +8418,7 @@ static int tg_set_cfs_quota(struct task_group *tg, long cfs_quota_us)
+ {
+ 	u64 quota, period;
+ 
+-	period = ktime_to_ns(tg->cfs_bandwidth.period);
++	period = ktime_to_ns(tg_cfs_bandwidth(tg)->period);
+ 	if (cfs_quota_us < 0)
+ 		quota = RUNTIME_INF;
+ 	else if ((u64)cfs_quota_us <= U64_MAX / NSEC_PER_USEC)
+@@ -8430,10 +8433,10 @@ static long tg_get_cfs_quota(struct task_group *tg)
+ {
+ 	u64 quota_us;
+ 
+-	if (tg->cfs_bandwidth.quota == RUNTIME_INF)
++	if (tg_cfs_bandwidth(tg)->quota == RUNTIME_INF)
+ 		return -1;
+ 
+-	quota_us = tg->cfs_bandwidth.quota;
++	quota_us = tg_cfs_bandwidth(tg)->quota;
+ 	do_div(quota_us, NSEC_PER_USEC);
+ 
+ 	return quota_us;
+@@ -8447,7 +8450,7 @@ static int tg_set_cfs_period(struct task_group *tg, long cfs_period_us)
+ 		return -EINVAL;
+ 
+ 	period = (u64)cfs_period_us * NSEC_PER_USEC;
+-	quota = tg->cfs_bandwidth.quota;
++	quota = tg_cfs_bandwidth(tg)->quota;
+ 
+ 	return tg_set_cfs_bandwidth(tg, period, quota);
+ }
+@@ -8456,7 +8459,7 @@ static long tg_get_cfs_period(struct task_group *tg)
+ {
+ 	u64 cfs_period_us;
+ 
+-	cfs_period_us = ktime_to_ns(tg->cfs_bandwidth.period);
++	cfs_period_us = ktime_to_ns(tg_cfs_bandwidth(tg)->period);
+ 	do_div(cfs_period_us, NSEC_PER_USEC);
+ 
+ 	return cfs_period_us;
+@@ -8518,13 +8521,14 @@ static u64 normalize_cfs_quota(struct task_group *tg,
+ static int tg_cfs_schedulable_down(struct task_group *tg, void *data)
+ {
+ 	struct cfs_schedulable_data *d = data;
+-	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(tg);
+ 	s64 quota = 0, parent_quota = -1;
+ 
+ 	if (!tg->parent) {
+ 		quota = RUNTIME_INF;
+ 	} else {
+-		struct cfs_bandwidth *parent_b = &tg->parent->cfs_bandwidth;
++		struct cfs_bandwidth_state *parent_b =
++			tg_cfs_bandwidth(tg->parent);
+ 
+ 		quota = normalize_cfs_quota(tg, d);
+ 		parent_quota = parent_b->hierarchical_quota;
+@@ -8572,7 +8576,7 @@ static int __cfs_schedulable(struct task_group *tg, u64 period, u64 quota)
+ static int cpu_cfs_stat_show(struct seq_file *sf, void *v)
+ {
+ 	struct task_group *tg = css_tg(seq_css(sf));
+-	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(tg);
+ 
+ 	seq_printf(sf, "nr_periods %d\n", cfs_b->nr_periods);
+ 	seq_printf(sf, "nr_throttled %d\n", cfs_b->nr_throttled);
+@@ -8684,7 +8688,7 @@ static int cpu_extra_stat_show(struct seq_file *sf,
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	{
+ 		struct task_group *tg = css_tg(css);
+-		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++		struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(tg);
+ 		u64 throttled_usec;
+ 
+ 		throttled_usec = cfs_b->throttled_time;
+diff --git a/kernel/sched/debug.c b/kernel/sched/debug.c
+index f799bcb..f10fd2d 100644
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -621,9 +621,9 @@ void print_cfs_rq(struct seq_file *m, int cpu, struct cfs_rq *cfs_rq)
+ #endif
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	SEQ_printf(m, "  .%-30s: %d\n", "throttled",
+-			cfs_rq->throttled);
++			cfs_rq_bw(cfs_rq)->throttled);
+ 	SEQ_printf(m, "  .%-30s: %d\n", "throttle_count",
+-			cfs_rq->throttle_count);
++			cfs_rq_bw(cfs_rq)->throttle_count);
+ #endif
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index 3fb105e..dd3fcb4 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4833,19 +4833,14 @@ static inline u64 sched_cfs_bandwidth_slice(void)
+  *
+  * requires cfs_b->lock
+  */
+-void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b)
++void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth_state *cfs_b)
+ {
+ 	if (cfs_b->quota != RUNTIME_INF)
+ 		cfs_b->runtime = cfs_b->quota;
+ }
+ 
+-static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
+-{
+-	return &tg->cfs_bandwidth;
+-}
+-
+ /* returns 0 on failure to allocate runtime */
+-static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
++static int __assign_cfs_rq_runtime(struct cfs_bandwidth_state *cfs_b,
+ 				   struct cfs_rq *cfs_rq, u64 target_runtime)
+ {
+ 	u64 min_amount, amount = 0;
+@@ -4853,7 +4848,7 @@ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
+ 	lockdep_assert_held(&cfs_b->lock);
+ 
+ 	/* note: this is a positive sum as runtime_remaining <= 0 */
+-	min_amount = target_runtime - cfs_rq->runtime_remaining;
++	min_amount = target_runtime - cfs_rq_bw(cfs_rq)->runtime_remaining;
+ 
+ 	if (cfs_b->quota == RUNTIME_INF)
+ 		amount = min_amount;
+@@ -4867,15 +4862,15 @@ static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
+ 		}
+ 	}
+ 
+-	cfs_rq->runtime_remaining += amount;
++	cfs_rq_bw(cfs_rq)->runtime_remaining += amount;
+ 
+-	return cfs_rq->runtime_remaining > 0;
++	return cfs_rq_bw(cfs_rq)->runtime_remaining > 0;
+ }
+ 
+ /* returns 0 on failure to allocate runtime */
+ static int assign_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+ 	int ret;
+ 
+ 	raw_spin_lock(&cfs_b->lock);
+@@ -4888,12 +4883,12 @@ static int assign_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ {
+ 	/* dock delta_exec before expiring quota (as it could span periods) */
+-	cfs_rq->runtime_remaining -= delta_exec;
++	cfs_rq_bw(cfs_rq)->runtime_remaining -= delta_exec;
+ 
+-	if (likely(cfs_rq->runtime_remaining > 0))
++	if (likely(cfs_rq_bw(cfs_rq)->runtime_remaining > 0))
+ 		return;
+ 
+-	if (cfs_rq->throttled)
++	if (cfs_rq_bw(cfs_rq)->throttled)
+ 		return;
+ 	/*
+ 	 * if we're unable to extend our runtime we resched so that the active
+@@ -4906,7 +4901,7 @@ static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ static __always_inline
+ void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ {
+-	if (!cfs_bandwidth_used() || !cfs_rq->runtime_enabled)
++	if (!cfs_bandwidth_used() || !cfs_rq_bw(cfs_rq)->runtime_enabled)
+ 		return;
+ 
+ 	__account_cfs_rq_runtime(cfs_rq, delta_exec);
+@@ -4914,13 +4909,13 @@ void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ 
+ static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+ {
+-	return cfs_bandwidth_used() && cfs_rq->throttled;
++	return cfs_bandwidth_used() && cfs_rq_bw(cfs_rq)->throttled;
+ }
+ 
+ /* check whether cfs_rq, or any parent, is throttled */
+ static inline int throttled_hierarchy(struct cfs_rq *cfs_rq)
+ {
+-	return cfs_bandwidth_used() && cfs_rq->throttle_count;
++	return cfs_bandwidth_used() && cfs_rq_bw(cfs_rq)->throttle_count;
+ }
+ 
+ /*
+@@ -4945,10 +4940,10 @@ static int tg_unthrottle_up(struct task_group *tg, void *data)
+ 	struct rq *rq = data;
+ 	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+-	cfs_rq->throttle_count--;
+-	if (!cfs_rq->throttle_count) {
+-		cfs_rq->throttled_clock_pelt_time += rq_clock_task_mult(rq) -
+-					     cfs_rq->throttled_clock_pelt;
++	cfs_rq_bw(cfs_rq)->throttle_count--;
++	if (!cfs_rq_bw(cfs_rq)->throttle_count) {
++		cfs_rq_bw(cfs_rq)->throttled_clock_pelt_time += rq_clock_task_mult(rq) -
++					     cfs_rq_bw(cfs_rq)->throttled_clock_pelt;
+ 
+ 		/* Add cfs_rq with already running entity in the list */
+ 		if (cfs_rq->nr_running >= 1)
+@@ -4964,11 +4959,11 @@ static int tg_throttle_down(struct task_group *tg, void *data)
+ 	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+ 	/* group is entering throttled state, stop time */
+-	if (!cfs_rq->throttle_count) {
+-		cfs_rq->throttled_clock_pelt = rq_clock_task_mult(rq);
++	if (!cfs_rq_bw(cfs_rq)->throttle_count) {
++		cfs_rq_bw(cfs_rq)->throttled_clock_pelt = rq_clock_task_mult(rq);
+ 		list_del_leaf_cfs_rq(cfs_rq);
+ 	}
+-	cfs_rq->throttle_count++;
++	cfs_rq_bw(cfs_rq)->throttle_count++;
+ 
+ 	return 0;
+ }
+@@ -4976,7 +4971,7 @@ static int tg_throttle_down(struct task_group *tg, void *data)
+ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+ 	struct sched_entity *se;
+ 	long task_delta, idle_task_delta, dequeue = 1;
+ 
+@@ -4993,7 +4988,7 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ 		 */
+ 		dequeue = 0;
+ 	} else {
+-		list_add_tail_rcu(&cfs_rq->throttled_list,
++		list_add_tail_rcu(&cfs_rq_bw(cfs_rq)->throttled_list,
+ 				  &cfs_b->throttled_cfs_rq);
+ 	}
+ 	raw_spin_unlock(&cfs_b->lock);
+@@ -5037,27 +5032,27 @@ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ 	 * Note: distribution will already see us throttled via the
+ 	 * throttled-list.  rq->lock protects completion.
+ 	 */
+-	cfs_rq->throttled = 1;
+-	cfs_rq->throttled_clock = rq_clock(rq);
++	cfs_rq_bw(cfs_rq)->throttled = 1;
++	cfs_rq_bw(cfs_rq)->throttled_clock = rq_clock(rq);
+ 	return true;
+ }
+ 
+ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+ 	struct sched_entity *se;
+ 	long task_delta, idle_task_delta;
+ 
+ 	se = cfs_rq->tg->se[cpu_of(rq)];
+ 
+-	cfs_rq->throttled = 0;
++	cfs_rq_bw(cfs_rq)->throttled = 0;
+ 
+ 	update_rq_clock(rq);
+ 
+ 	raw_spin_lock(&cfs_b->lock);
+-	cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
+-	list_del_rcu(&cfs_rq->throttled_list);
++	cfs_b->throttled_time += rq_clock(rq) - cfs_rq_bw(cfs_rq)->throttled_clock;
++	list_del_rcu(&cfs_rq_bw(cfs_rq)->throttled_list);
+ 	raw_spin_unlock(&cfs_b->lock);
+ 
+ 	/* update hierarchical throttle state */
+@@ -5127,14 +5122,15 @@ unthrottle_throttle:
+ 		resched_curr(rq);
+ }
+ 
+-static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
++static void distribute_cfs_runtime(struct cfs_bandwidth_state *cfs_b)
+ {
+-	struct cfs_rq *cfs_rq;
++	struct cfs_rq_bandwidth *bwc;
+ 	u64 runtime, remaining = 1;
+ 
+ 	rcu_read_lock();
+-	list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
++	list_for_each_entry_rcu(bwc, &cfs_b->throttled_cfs_rq,
+ 				throttled_list) {
++		struct cfs_rq *cfs_rq = bwc->cfs_rq;
+ 		struct rq *rq = rq_of(cfs_rq);
+ 		struct rq_flags rf;
+ 
+@@ -5143,20 +5139,20 @@ static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
+ 			goto next;
+ 
+ 		/* By the above check, this should never be true */
+-		SCHED_WARN_ON(cfs_rq->runtime_remaining > 0);
++		SCHED_WARN_ON(cfs_rq_bw(cfs_rq)->runtime_remaining > 0);
+ 
+ 		raw_spin_lock(&cfs_b->lock);
+-		runtime = -cfs_rq->runtime_remaining + 1;
++		runtime = -cfs_rq_bw(cfs_rq)->runtime_remaining + 1;
+ 		if (runtime > cfs_b->runtime)
+ 			runtime = cfs_b->runtime;
+ 		cfs_b->runtime -= runtime;
+ 		remaining = cfs_b->runtime;
+ 		raw_spin_unlock(&cfs_b->lock);
+ 
+-		cfs_rq->runtime_remaining += runtime;
++		cfs_rq_bw(cfs_rq)->runtime_remaining += runtime;
+ 
+ 		/* we check whether we're throttled above */
+-		if (cfs_rq->runtime_remaining > 0)
++		if (cfs_rq_bw(cfs_rq)->runtime_remaining > 0)
+ 			unthrottle_cfs_rq(cfs_rq);
+ 
+ next:
+@@ -5174,7 +5170,7 @@ next:
+  * period the timer is deactivated until scheduling resumes; cfs_b->idle is
+  * used to track this state.
+  */
+-static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, unsigned long flags)
++static int do_sched_cfs_period_timer(struct cfs_bandwidth_state *cfs_b, int overrun, unsigned long flags)
+ {
+ 	int throttled;
+ 
+@@ -5243,7 +5239,7 @@ static const u64 cfs_bandwidth_slack_period = 5 * NSEC_PER_MSEC;
+  * hrtimer base being cleared by hrtimer_start. In the case of
+  * migrate_hrtimers, base is never cleared, so we are fine.
+  */
+-static int runtime_refresh_within(struct cfs_bandwidth *cfs_b, u64 min_expire)
++static int runtime_refresh_within(struct cfs_bandwidth_state *cfs_b, u64 min_expire)
+ {
+ 	struct hrtimer *refresh_timer = &cfs_b->period_timer;
+ 	s64 remaining;
+@@ -5260,7 +5256,7 @@ static int runtime_refresh_within(struct cfs_bandwidth *cfs_b, u64 min_expire)
+ 	return 0;
+ }
+ 
+-static void start_cfs_slack_bandwidth(struct cfs_bandwidth *cfs_b)
++static void start_cfs_slack_bandwidth(struct cfs_bandwidth_state *cfs_b)
+ {
+ 	u64 min_left = cfs_bandwidth_slack_period + min_bandwidth_expiration;
+ 
+@@ -5281,8 +5277,8 @@ static void start_cfs_slack_bandwidth(struct cfs_bandwidth *cfs_b)
+ /* we know any runtime found here is valid as update_curr() precedes return */
+ static void __return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+-	s64 slack_runtime = cfs_rq->runtime_remaining - min_cfs_rq_runtime;
++	struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	s64 slack_runtime = cfs_rq_bw(cfs_rq)->runtime_remaining - min_cfs_rq_runtime;
+ 
+ 	if (slack_runtime <= 0)
+ 		return;
+@@ -5299,7 +5295,7 @@ static void __return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ 	raw_spin_unlock(&cfs_b->lock);
+ 
+ 	/* even if it's not valid for return we don't want to try again */
+-	cfs_rq->runtime_remaining -= slack_runtime;
++	cfs_rq_bw(cfs_rq)->runtime_remaining -= slack_runtime;
+ }
+ 
+ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+@@ -5307,7 +5303,7 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ 	if (!cfs_bandwidth_used())
+ 		return;
+ 
+-	if (!cfs_rq->runtime_enabled || cfs_rq->nr_running)
++	if (!cfs_rq_bw(cfs_rq)->runtime_enabled || cfs_rq->nr_running)
+ 		return;
+ 
+ 	__return_cfs_rq_runtime(cfs_rq);
+@@ -5317,7 +5313,7 @@ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+  * This is done with a timer (instead of inline with bandwidth return) since
+  * it's necessary to juggle rq->locks to unthrottle their respective cfs_rqs.
+  */
+-static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
++static void do_sched_cfs_slack_timer(struct cfs_bandwidth_state *cfs_b)
+ {
+ 	u64 runtime = 0, slice = sched_cfs_bandwidth_slice();
+ 	unsigned long flags;
+@@ -5356,7 +5352,7 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
+ 		return;
+ 
+ 	/* an active group must be handled by the update_curr()->put() path */
+-	if (!cfs_rq->runtime_enabled || cfs_rq->curr)
++	if (!cfs_rq_bw(cfs_rq)->runtime_enabled || cfs_rq->curr)
+ 		return;
+ 
+ 	/* ensure the group is not already throttled */
+@@ -5365,7 +5361,7 @@ static void check_enqueue_throttle(struct cfs_rq *cfs_rq)
+ 
+ 	/* update runtime allocation */
+ 	account_cfs_rq_runtime(cfs_rq, 0);
+-	if (cfs_rq->runtime_remaining <= 0)
++	if (cfs_rq_bw(cfs_rq)->runtime_remaining <= 0)
+ 		throttle_cfs_rq(cfs_rq);
+ }
+ 
+@@ -5382,8 +5378,8 @@ static void sync_throttle(struct task_group *tg, int cpu)
+ 	cfs_rq = tg->cfs_rq[cpu];
+ 	pcfs_rq = tg->parent->cfs_rq[cpu];
+ 
+-	cfs_rq->throttle_count = pcfs_rq->throttle_count;
+-	cfs_rq->throttled_clock_pelt = rq_clock_task_mult(cpu_rq(cpu));
++	cfs_rq_bw(cfs_rq)->throttle_count = cfs_rq_bw(pcfs_rq)->throttle_count;
++	cfs_rq_bw(cfs_rq)->throttled_clock_pelt = rq_clock_task_mult(cpu_rq(cpu));
+ }
+ 
+ /* conditionally throttle active cfs_rq's from put_prev_entity() */
+@@ -5392,7 +5388,7 @@ static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ 	if (!cfs_bandwidth_used())
+ 		return false;
+ 
+-	if (likely(!cfs_rq->runtime_enabled || cfs_rq->runtime_remaining > 0))
++	if (likely(!cfs_rq_bw(cfs_rq)->runtime_enabled || cfs_rq_bw(cfs_rq)->runtime_remaining > 0))
+ 		return false;
+ 
+ 	/*
+@@ -5407,8 +5403,8 @@ static bool check_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ 
+ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
+ {
+-	struct cfs_bandwidth *cfs_b =
+-		container_of(timer, struct cfs_bandwidth, slack_timer);
++	struct cfs_bandwidth_state *cfs_b =
++		container_of(timer, struct cfs_bandwidth_state, slack_timer);
+ 
+ 	do_sched_cfs_slack_timer(cfs_b);
+ 
+@@ -5419,8 +5415,8 @@ extern const u64 max_cfs_quota_period;
+ 
+ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
+ {
+-	struct cfs_bandwidth *cfs_b =
+-		container_of(timer, struct cfs_bandwidth, period_timer);
++	struct cfs_bandwidth_state *cfs_b =
++		container_of(timer, struct cfs_bandwidth_state, period_timer);
+ 	unsigned long flags;
+ 	int overrun;
+ 	int idle = 0;
+@@ -5471,7 +5467,18 @@ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
+ 	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
+ }
+ 
+-void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
++static struct cfs_rq_bandwidth root_cfs_rq_bandwidth[NR_CPUS];
++struct cfs_bandwidth_state root_cfs_bandwidth = {
++	.rq_state = root_cfs_rq_bandwidth,
++};
++
++void __init init_root_cfs_bandwidth(void)
++{
++	init_cfs_bandwidth(&root_cfs_bandwidth, NULL);
++}
++
++void init_cfs_bandwidth(struct cfs_bandwidth_state *cfs_b,
++			      struct cfs_bandwidth_state *parent)
+ {
+ 	raw_spin_lock_init(&cfs_b->lock);
+ 	cfs_b->runtime = 0;
+@@ -5486,13 +5493,17 @@ void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ 	cfs_b->slack_started = false;
+ }
+ 
+-static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
++static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq, int cpu)
+ {
+-	cfs_rq->runtime_enabled = 0;
+-	INIT_LIST_HEAD(&cfs_rq->throttled_list);
++	struct cfs_rq_bandwidth *cfs_rq_b =
++		&tg_cfs_bandwidth(cfs_rq->tg)->rq_state[cpu];
++
++	cfs_rq_b->cfs_rq = cfs_rq;
++	cfs_rq_b->runtime_enabled = 0;
++	INIT_LIST_HEAD(&cfs_rq_b->throttled_list);
+ }
+ 
+-void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
++void start_cfs_bandwidth(struct cfs_bandwidth_state *cfs_b)
+ {
+ 	lockdep_assert_held(&cfs_b->lock);
+ 
+@@ -5504,7 +5515,7 @@ void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+ 	hrtimer_start_expires(&cfs_b->period_timer, HRTIMER_MODE_ABS_PINNED);
+ }
+ 
+-static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
++static void destroy_cfs_bandwidth(struct cfs_bandwidth_state *cfs_b)
+ {
+ 	/* init_cfs_bandwidth() was not called */
+ 	if (!cfs_b->throttled_cfs_rq.next)
+@@ -5530,11 +5541,11 @@ static void __maybe_unused update_runtime_enabled(struct rq *rq)
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(tg, &task_groups, list) {
+-		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++		struct cfs_bandwidth_state *cfs_b = tg_cfs_bandwidth(tg);
+ 		struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+ 		raw_spin_lock(&cfs_b->lock);
+-		cfs_rq->runtime_enabled = cfs_b->quota != RUNTIME_INF;
++		cfs_rq_bw(cfs_rq)->runtime_enabled = cfs_b->quota != RUNTIME_INF;
+ 		raw_spin_unlock(&cfs_b->lock);
+ 	}
+ 	rcu_read_unlock();
+@@ -5551,19 +5562,19 @@ static void __maybe_unused unthrottle_offline_cfs_rqs(struct rq *rq)
+ 	list_for_each_entry_rcu(tg, &task_groups, list) {
+ 		struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+-		if (!cfs_rq->runtime_enabled)
++		if (!cfs_rq_bw(cfs_rq)->runtime_enabled)
+ 			continue;
+ 
+ 		/*
+ 		 * clock_task is not advancing so we just need to make sure
+ 		 * there's some valid quota amount
+ 		 */
+-		cfs_rq->runtime_remaining = 1;
++		cfs_rq_bw(cfs_rq)->runtime_remaining = 1;
+ 		/*
+ 		 * Offline rq is schedulable till CPU is completely disabled
+ 		 * in take_cpu_down(), so we prevent new cfs throttling here.
+ 		 */
+-		cfs_rq->runtime_enabled = 0;
++		cfs_rq_bw(cfs_rq)->runtime_enabled = 0;
+ 
+ 		if (cfs_rq_throttled(cfs_rq))
+ 			unthrottle_cfs_rq(cfs_rq);
+@@ -5600,17 +5611,15 @@ static inline int throttled_lb_pair(struct task_group *tg,
+ 	return 0;
+ }
+ 
+-void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b) {}
++void init_cfs_bandwidth(struct cfs_bandwidth_state *cfs_b,
++			struct cfs_bandwidth_state *parent) {}
++void __init init_root_cfs_bandwidth(void) {}
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+-static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
++static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq, int cpu) {}
+ #endif
+ 
+-static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
+-{
+-	return NULL;
+-}
+-static inline void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b) {}
++static inline void destroy_cfs_bandwidth(struct cfs_bandwidth_state *cfs_b) {}
+ static inline void update_runtime_enabled(struct rq *rq) {}
+ static inline void unthrottle_offline_cfs_rqs(struct rq *rq) {}
+ 
+@@ -11430,6 +11439,11 @@ void free_fair_sched_group(struct task_group *tg)
+ 
+ 	kfree(tg->cfs_rq);
+ 	kfree(tg->se);
++#ifdef CONFIG_CFS_BANDWIDTH
++	/* Unpublished groups, or groups past unregister and its RCU grace period. */
++	kfree(tg_cfs_bandwidth(tg)->rq_state);
++	/* The bandwidth object itself is freed with task_group_cache. */
++#endif
+ }
+ 
+ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+@@ -11447,7 +11461,14 @@ int alloc_fair_sched_group(struct task_group *tg, struct task_group *parent)
+ 
+ 	tg->shares = NICE_0_LOAD;
+ 
+-	init_cfs_bandwidth(tg_cfs_bandwidth(tg));
++#ifdef CONFIG_CFS_BANDWIDTH
++	tg_cfs_bandwidth(tg)->rq_state =
++		kcalloc(nr_cpu_ids, sizeof(struct cfs_rq_bandwidth), GFP_KERNEL);
++	if (!tg_cfs_bandwidth(tg)->rq_state)
++		goto err;
++#endif
++
++	init_cfs_bandwidth(tg_cfs_bandwidth(tg), tg_cfs_bandwidth(parent));
+ 
+ 	for_each_possible_cpu(i) {
+ 		cfs_rq = kzalloc_node(sizeof(struct cfs_rq),
+@@ -11524,7 +11545,7 @@ void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+ 
+ 	cfs_rq->tg = tg;
+ 	cfs_rq->rq = rq;
+-	init_cfs_rq_runtime(cfs_rq);
++	init_cfs_rq_runtime(cfs_rq, cpu);
+ 
+ 	tg->cfs_rq[cpu] = cfs_rq;
+ 	tg->se[cpu] = se;
+diff --git a/kernel/sched/pelt.h b/kernel/sched/pelt.h
+index 0245e3e..a43378a 100644
+--- a/kernel/sched/pelt.h
++++ b/kernel/sched/pelt.h
+@@ -151,10 +151,12 @@ static inline u64 rq_clock_pelt(struct rq *rq)
+ /* rq->task_clock normalized against any time this cfs_rq has spent throttled */
+ static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
+ {
+-	if (unlikely(cfs_rq->throttle_count))
+-		return cfs_rq->throttled_clock_pelt - cfs_rq->throttled_clock_pelt_time;
++	if (unlikely(cfs_rq_bw(cfs_rq)->throttle_count))
++		return cfs_rq_bw(cfs_rq)->throttled_clock_pelt -
++		       cfs_rq_bw(cfs_rq)->throttled_clock_pelt_time;
+ 
+-	return rq_clock_pelt(rq_of(cfs_rq)) - cfs_rq->throttled_clock_pelt_time;
++	return rq_clock_pelt(rq_of(cfs_rq)) -
++	       cfs_rq_bw(cfs_rq)->throttled_clock_pelt_time;
+ }
+ #else
+ static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 2599a0d..0fa2e96 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -362,7 +362,11 @@ struct rt_rq;
+ 
+ extern struct list_head task_groups;
+ 
+-struct cfs_bandwidth {
++/* Keep the CONFIG_CFS_BANDWIDTH=n KMI placeholder empty. */
++struct cfs_bandwidth { };
++
++/* Bandwidth state is kept outside KMI-visible scheduler structures. */
++struct cfs_bandwidth_state {
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	raw_spinlock_t		lock;
+ 	ktime_t			period;
+@@ -381,6 +385,7 @@ struct cfs_bandwidth {
+ 	int			nr_periods;
+ 	int			nr_throttled;
+ 	u64			throttled_time;
++	struct cfs_rq_bandwidth	*rq_state;
+ #endif
+ };
+ 
+@@ -444,6 +449,19 @@ struct task_group {
+ 	ANDROID_KABI_RESERVE(4);
+ };
+ 
++/*
++ * Only scheduler-owned dynamic groups use this allocation.  Vendor modules
++ * already use task_group's KABI reserves, so bandwidth state must live past
++ * the entire public object, not in a reserve.  The static root_task_group
++ * has separate bandwidth storage.
++ */
++struct task_group_allocation {
++	struct task_group tg;
++#ifdef CONFIG_CFS_BANDWIDTH
++	struct cfs_bandwidth_state cfs_bandwidth;
++#endif
++};
++
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ #define ROOT_TASK_GROUP_LOAD	NICE_0_LOAD
+ 
+@@ -484,10 +502,27 @@ extern void unregister_fair_sched_group(struct task_group *tg);
+ extern void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+ 			struct sched_entity *se, int cpu,
+ 			struct sched_entity *parent);
+-extern void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
++extern void init_cfs_bandwidth(struct cfs_bandwidth_state *cfs_b,
++			       struct cfs_bandwidth_state *parent);
++extern void init_root_cfs_bandwidth(void);
++
++#ifdef CONFIG_CFS_BANDWIDTH
++extern struct cfs_bandwidth_state root_cfs_bandwidth;
++#endif
++
++static inline struct cfs_bandwidth_state *tg_cfs_bandwidth(struct task_group *tg)
++{
++#ifdef CONFIG_CFS_BANDWIDTH
++	if (tg == &root_task_group)
++		return &root_cfs_bandwidth;
++	return &container_of(tg, struct task_group_allocation, tg)->cfs_bandwidth;
++#else
++	return NULL;
++#endif
++}
+ 
+-extern void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b);
+-extern void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
++extern void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth_state *cfs_b);
++extern void start_cfs_bandwidth(struct cfs_bandwidth_state *cfs_b);
+ extern void unthrottle_cfs_rq(struct cfs_rq *cfs_rq);
+ 
+ extern void free_rt_sched_group(struct task_group *tg);
+@@ -603,7 +638,14 @@ struct cfs_rq {
+ 	struct list_head	leaf_cfs_rq_list;
+ 	struct task_group	*tg;	/* group that "owns" this runqueue */
+ 
++	ANDROID_VENDOR_DATA_ARRAY(1, 16);
++#endif /* CONFIG_FAIR_GROUP_SCHED */
++};
++
+ #ifdef CONFIG_CFS_BANDWIDTH
++struct cfs_rq_bandwidth {
++	/* Backpointer for the throttle and asynchronous unthrottle lists. */
++	struct cfs_rq		*cfs_rq;
+ 	int			runtime_enabled;
+ 	s64			runtime_remaining;
+ 
+@@ -613,11 +655,8 @@ struct cfs_rq {
+ 	int			throttled;
+ 	int			throttle_count;
+ 	struct list_head	throttled_list;
+-#endif /* CONFIG_CFS_BANDWIDTH */
+-
+-	ANDROID_VENDOR_DATA_ARRAY(1, 16);
+-#endif /* CONFIG_FAIR_GROUP_SCHED */
+ };
++#endif /* CONFIG_CFS_BANDWIDTH */
+ 
+ static inline int rt_bandwidth_enabled(void)
+ {
+@@ -1111,6 +1150,13 @@ static inline int cpu_of(struct rq *rq)
+ #endif
+ }
+ 
++#ifdef CONFIG_CFS_BANDWIDTH
++static inline struct cfs_rq_bandwidth *cfs_rq_bw(struct cfs_rq *cfs_rq)
++{
++	return &tg_cfs_bandwidth(cfs_rq->tg)->rq_state[cpu_of(rq_of(cfs_rq))];
++}
++#endif
++
+ 
+ #ifdef CONFIG_SCHED_SMT
+ extern void __update_idle_core(struct rq *rq);
